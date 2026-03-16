@@ -1,12 +1,16 @@
 //! Piece and parameter definitions that describe what can live on a graph.
+//!
+//! Architecture rule: this crate stays target-agnostic. Target-specific AST
+//! rewrites or lowering quirks belong in host/target adapters, not in the
+//! core piece model.
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
-use serde_json::{Number, Value};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
-use crate::code_expr::CodeExpr;
-use crate::types::{PieceCategory, PortType, TileSide};
+use crate::ast::{Expr, parse_ident_path};
+use crate::types::{PieceCategory, PieceSemanticKind, PortType, TileSide};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -21,10 +25,11 @@ pub enum ParamValueKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-/// How an inline JSON value should be converted into a [`CodeExpr`].
+/// How an inline JSON value should be converted into an [`Expr`].
 pub enum ParamInlineMode {
     Literal,
-    Raw,
+    #[serde(alias = "raw")]
+    Ident,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -103,18 +108,12 @@ impl ParamSchema {
     }
 
     /// Convert the schema's default into a compile-time expression, when one exists.
-    pub fn default_expr(&self) -> Option<CodeExpr> {
+    pub fn default_expr(&self) -> Option<Expr> {
         match self {
-            ParamSchema::Number { default, .. } => Some(CodeExpr::Literal(Value::Number(
-                Number::from_f64(*default).unwrap_or_else(|| Number::from(0)),
-            ))),
-            ParamSchema::Text { default, .. } => {
-                Some(CodeExpr::Literal(Value::String(default.clone())))
-            }
-            ParamSchema::Enum { default, .. } => {
-                Some(CodeExpr::Literal(Value::String(default.clone())))
-            }
-            ParamSchema::Bool { default, .. } => Some(CodeExpr::Literal(Value::Bool(*default))),
+            ParamSchema::Number { default, .. } => Some(Expr::float(*default)),
+            ParamSchema::Text { default, .. } => Some(Expr::str_lit(default.as_str())),
+            ParamSchema::Enum { default, .. } => Some(Expr::str_lit(default.as_str())),
+            ParamSchema::Bool { default, .. } => Some(Expr::bool_lit(*default)),
             ParamSchema::Custom {
                 default,
                 inline_mode,
@@ -149,25 +148,33 @@ impl ParamSchema {
                 value_kind,
                 min,
                 max,
+                inline_mode,
                 ..
-            } => match value_kind {
-                ParamValueKind::Number => validate_number(value, *min, *max),
-                ParamValueKind::Text => value.is_string(),
-                ParamValueKind::Bool => value.is_boolean(),
-                ParamValueKind::Json => true,
-                ParamValueKind::None => false,
-            },
+            } => {
+                if matches!(inline_mode, ParamInlineMode::Ident) {
+                    return value
+                        .as_str()
+                        .is_some_and(|s| parse_ident_path(s).is_some());
+                }
+                match value_kind {
+                    ParamValueKind::Number => validate_number(value, *min, *max),
+                    ParamValueKind::Text => value.is_string(),
+                    ParamValueKind::Bool => value.is_boolean(),
+                    ParamValueKind::Json => true,
+                    ParamValueKind::None => false,
+                }
+            }
         }
     }
 
     /// Convert an already-validated inline value into a compile-time expression.
-    pub fn inline_expr(&self, value: &Value) -> Option<CodeExpr> {
+    pub fn inline_expr(&self, value: &Value) -> Option<Expr> {
         if !self.validate_inline_value(value) {
             return None;
         }
         match self {
             ParamSchema::Custom { inline_mode, .. } => value_to_expr(value, inline_mode),
-            _ => Some(CodeExpr::Literal(value.clone())),
+            _ => Some(Expr::from_json_value(value)),
         }
     }
 }
@@ -189,10 +196,10 @@ fn validate_number(value: &Value, min: Option<f64>, max: Option<f64>) -> bool {
     true
 }
 
-fn value_to_expr(value: &Value, inline_mode: &ParamInlineMode) -> Option<CodeExpr> {
+fn value_to_expr(value: &Value, inline_mode: &ParamInlineMode) -> Option<Expr> {
     match inline_mode {
-        ParamInlineMode::Literal => Some(CodeExpr::Literal(value.clone())),
-        ParamInlineMode::Raw => value.as_str().map(|raw| CodeExpr::Raw(raw.to_string())),
+        ParamInlineMode::Literal => Some(Expr::from_json_value(value)),
+        ParamInlineMode::Ident => value.as_str().and_then(parse_ident_path),
     }
 }
 
@@ -213,12 +220,15 @@ pub struct ParamDef {
     pub required: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 /// Static description of a placeable piece.
 pub struct PieceDef {
     pub id: String,
     pub label: String,
     pub category: PieceCategory,
+    pub semantic_kind: PieceSemanticKind,
+    #[serde(default = "default_piece_namespace")]
+    pub namespace: String,
     #[serde(default)]
     pub params: Vec<ParamDef>,
     pub output_type: Option<PortType>,
@@ -229,7 +239,72 @@ pub struct PieceDef {
 impl PieceDef {
     /// Return whether this piece terminates compilation rather than producing output.
     pub fn is_terminal(&self) -> bool {
-        self.output_type.is_none() || matches!(self.category, PieceCategory::Output)
+        self.output_type.is_none() || matches!(self.semantic_kind, PieceSemanticKind::Output)
+    }
+
+    /// Return whether this piece should be visible for the requested target namespace.
+    pub fn is_visible_in_namespace(&self, namespace: &str) -> bool {
+        self.namespace == "core"
+            || self.namespace == namespace
+            || matches!(self.semantic_kind, PieceSemanticKind::Trick)
+    }
+}
+
+fn default_piece_namespace() -> String {
+    "core".into()
+}
+
+fn infer_semantic_kind(namespace: &str, category: PieceCategory) -> PieceSemanticKind {
+    if namespace != "core" {
+        return PieceSemanticKind::Intrinsic;
+    }
+
+    match category {
+        PieceCategory::Constant => PieceSemanticKind::Literal,
+        PieceCategory::Control => PieceSemanticKind::Construct,
+        PieceCategory::Output => PieceSemanticKind::Output,
+        PieceCategory::Connector => PieceSemanticKind::Connector,
+        PieceCategory::Transform | PieceCategory::Generator => PieceSemanticKind::Operator,
+        PieceCategory::Trick => PieceSemanticKind::Trick,
+    }
+}
+
+impl<'de> Deserialize<'de> for PieceDef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct PieceDefSerde {
+            id: String,
+            label: String,
+            category: PieceCategory,
+            semantic_kind: Option<PieceSemanticKind>,
+            namespace: Option<String>,
+            #[serde(default)]
+            params: Vec<ParamDef>,
+            output_type: Option<PortType>,
+            output_side: Option<TileSide>,
+            description: Option<String>,
+        }
+
+        let raw = PieceDefSerde::deserialize(deserializer)?;
+        let namespace = raw.namespace.unwrap_or_else(default_piece_namespace);
+        let semantic_kind = raw
+            .semantic_kind
+            .unwrap_or_else(|| infer_semantic_kind(namespace.as_str(), raw.category));
+
+        Ok(Self {
+            id: raw.id,
+            label: raw.label,
+            category: raw.category,
+            semantic_kind,
+            namespace,
+            params: raw.params,
+            output_type: raw.output_type,
+            output_side: raw.output_side,
+            description: raw.description,
+        })
     }
 }
 
@@ -237,19 +312,19 @@ impl PieceDef {
 /// Inputs resolved for a node at compile time.
 pub struct PieceInputs {
     #[serde(default)]
-    pub scalar: BTreeMap<String, CodeExpr>,
+    pub scalar: BTreeMap<String, Expr>,
     #[serde(default)]
-    pub variadic: BTreeMap<String, Vec<CodeExpr>>,
+    pub variadic: BTreeMap<String, Vec<Expr>>,
 }
 
 impl PieceInputs {
     /// Return a resolved scalar input by id.
-    pub fn get(&self, key: &str) -> Option<&CodeExpr> {
+    pub fn get(&self, key: &str) -> Option<&Expr> {
         self.scalar.get(key)
     }
 
     /// Return a resolved variadic input group by id.
-    pub fn get_variadic(&self, key: &str) -> Option<&Vec<CodeExpr>> {
+    pub fn get_variadic(&self, key: &str) -> Option<&Vec<Expr>> {
         self.variadic.get(key)
     }
 }
@@ -260,7 +335,7 @@ pub trait Piece: Send + Sync {
     fn def(&self) -> &PieceDef;
 
     /// Compile this node using its resolved graph inputs and inline params.
-    fn compile(&self, inputs: &PieceInputs, inline_params: &BTreeMap<String, Value>) -> CodeExpr;
+    fn compile(&self, inputs: &PieceInputs, inline_params: &BTreeMap<String, Value>) -> Expr;
 
     /// Return per-side output expressions for multi-output pieces (e.g. cross connectors).
     /// When `Some`, the compiler resolves edges by matching the exit direction to the
@@ -269,7 +344,7 @@ pub trait Piece: Send + Sync {
         &self,
         _inputs: &PieceInputs,
         _inline_params: &BTreeMap<String, Value>,
-    ) -> Option<BTreeMap<TileSide, CodeExpr>> {
+    ) -> Option<BTreeMap<TileSide, Expr>> {
         None
     }
 
@@ -284,15 +359,18 @@ pub trait Piece: Send + Sync {
         inputs: &PieceInputs,
         inline_params: &BTreeMap<String, Value>,
         state: &Value,
-    ) -> (CodeExpr, Value) {
+    ) -> (Expr, Value) {
         (self.compile(inputs, inline_params), state.clone())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ParamDef, ParamSchema, ParamTextSemantics};
-    use crate::types::TileSide;
+    use super::{
+        ParamDef, ParamInlineMode, ParamSchema, ParamTextSemantics, ParamValueKind, PieceDef,
+    };
+    use crate::ast::Expr;
+    use crate::types::{PieceCategory, PieceSemanticKind, TileSide};
     use serde_json::json;
 
     #[test]
@@ -330,5 +408,143 @@ mod tests {
 
         let value = serde_json::to_value(&param).expect("serialize param def");
         assert_eq!(value.get("text_semantics"), Some(&json!("mini")));
+    }
+
+    #[test]
+    fn inline_ident_parses_dotted_path_into_fields() {
+        let schema = ParamSchema::Custom {
+            port_type: "any".into(),
+            value_kind: ParamValueKind::Text,
+            default: None,
+            can_inline: true,
+            inline_mode: ParamInlineMode::Ident,
+            min: None,
+            max: None,
+        };
+
+        let expr = schema
+            .inline_expr(&json!("foo.bar.baz"))
+            .expect("identifier path");
+        assert_eq!(
+            expr,
+            Expr::field(Expr::field(Expr::ident("foo"), "bar"), "baz")
+        );
+    }
+
+    #[test]
+    fn inline_ident_rejects_invalid_path() {
+        let schema = ParamSchema::Custom {
+            port_type: "any".into(),
+            value_kind: ParamValueKind::Text,
+            default: None,
+            can_inline: true,
+            inline_mode: ParamInlineMode::Ident,
+            min: None,
+            max: None,
+        };
+
+        assert!(!schema.validate_inline_value(&json!("foo..bar")));
+        assert!(schema.inline_expr(&json!("foo..bar")).is_none());
+    }
+
+    #[test]
+    fn inline_mode_raw_alias_deserializes_to_ident() {
+        let mode: ParamInlineMode = serde_json::from_value(json!("raw")).expect("alias");
+        assert_eq!(mode, ParamInlineMode::Ident);
+    }
+
+    #[test]
+    fn piece_def_defaults_core_namespace_and_semantic_kind() {
+        let value = json!({
+            "id": "core.not",
+            "label": "not",
+            "category": "transform",
+            "params": [],
+            "output_type": "bool",
+            "output_side": "right",
+            "description": null
+        });
+
+        let parsed: PieceDef = serde_json::from_value(value).expect("deserialize piece def");
+        assert_eq!(parsed.namespace, "core");
+        assert_eq!(parsed.semantic_kind, PieceSemanticKind::Operator);
+    }
+
+    #[test]
+    fn piece_def_defaults_non_core_namespace_to_intrinsic() {
+        let value = json!({
+            "id": "strudel.fast",
+            "label": "fast",
+            "category": "generator",
+            "namespace": "strudel",
+            "params": [],
+            "output_type": "pattern",
+            "output_side": "right",
+            "description": null
+        });
+
+        let parsed: PieceDef = serde_json::from_value(value).expect("deserialize piece def");
+        assert_eq!(parsed.namespace, "strudel");
+        assert_eq!(parsed.semantic_kind, PieceSemanticKind::Intrinsic);
+    }
+
+    #[test]
+    fn piece_def_explicit_semantic_kind_overrides_defaults() {
+        let value = json!({
+            "id": "user.twist",
+            "label": "twist",
+            "category": "trick",
+            "semantic_kind": "trick",
+            "namespace": "user",
+            "params": [],
+            "output_type": "any",
+            "output_side": "right",
+            "description": null
+        });
+
+        let parsed: PieceDef = serde_json::from_value(value).expect("deserialize piece def");
+        assert_eq!(parsed.semantic_kind, PieceSemanticKind::Trick);
+    }
+
+    #[test]
+    fn piece_def_visibility_includes_core_matching_namespace_and_tricks() {
+        let core_piece = PieceDef {
+            id: "core.lt".into(),
+            label: "lt".into(),
+            category: PieceCategory::Transform,
+            semantic_kind: PieceSemanticKind::Operator,
+            namespace: "core".into(),
+            params: vec![],
+            output_type: Some("bool".into()),
+            output_side: Some(TileSide::RIGHT),
+            description: None,
+        };
+        let intrinsic_piece = PieceDef {
+            id: "strudel.fast".into(),
+            label: "fast".into(),
+            category: PieceCategory::Transform,
+            semantic_kind: PieceSemanticKind::Intrinsic,
+            namespace: "strudel".into(),
+            params: vec![],
+            output_type: Some("pattern".into()),
+            output_side: Some(TileSide::RIGHT),
+            description: None,
+        };
+        let trick_piece = PieceDef {
+            id: "user.twist".into(),
+            label: "twist".into(),
+            category: PieceCategory::Trick,
+            semantic_kind: PieceSemanticKind::Trick,
+            namespace: "user".into(),
+            params: vec![],
+            output_type: Some("any".into()),
+            output_side: Some(TileSide::RIGHT),
+            description: None,
+        };
+
+        assert!(core_piece.is_visible_in_namespace("lua"));
+        assert!(intrinsic_piece.is_visible_in_namespace("strudel"));
+        assert!(!intrinsic_piece.is_visible_in_namespace("lua"));
+        assert!(trick_piece.is_visible_in_namespace("lua"));
     }
 }

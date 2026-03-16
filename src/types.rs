@@ -5,38 +5,38 @@ use uuid::Uuid;
 
 // Determinism contract: GridPos ordering is always col-first, then row.
 // Keep Ord impl explicit so future field edits do not silently change topo tie-breaking.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GridPos {
     pub col: i32,
     pub row: i32,
 }
 
 impl GridPos {
-    pub fn adjacent_in_direction(&self, side: TileSide) -> Self {
+    pub fn adjacent_in_direction(&self, side: Option<TileSide>) -> Self {
         match side {
-            TileSide::TOP => Self {
+            Some(TileSide::TOP) => Self {
                 col: self.col,
                 row: self.row - 1,
             },
-            TileSide::BOTTOM => Self {
+            Some(TileSide::BOTTOM) => Self {
                 col: self.col,
                 row: self.row + 1,
             },
-            TileSide::RIGHT => Self {
+            Some(TileSide::RIGHT) => Self {
                 col: self.col + 1,
                 row: self.row,
             },
-            TileSide::LEFT => Self {
+            Some(TileSide::LEFT) => Self {
                 col: self.col - 1,
                 row: self.row,
             },
-            TileSide::NONE => self.clone(),
+            None => self.clone(),
         }
     }
 }
 
-pub fn adjacent_in_direction(pos: &GridPos, side: &TileSide) -> GridPos {
-    pos.adjacent_in_direction(*side)
+pub fn adjacent_in_direction(pos: &GridPos, side: Option<TileSide>) -> GridPos {
+    pos.adjacent_in_direction(side)
 }
 
 impl PartialOrd for GridPos {
@@ -115,13 +115,8 @@ impl From<String> for PortType {
     }
 }
 
-#[derive(
-    Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum TileSide {
-    #[default]
-    #[serde(rename = "none", alias = "n_o_n_e")]
-    NONE,
     #[serde(rename = "top", alias = "north", alias = "t_o_p")]
     TOP,
     #[serde(
@@ -154,12 +149,11 @@ impl TileSide {
             TileSide::BOTTOM => TileSide::TOP,
             TileSide::LEFT => TileSide::RIGHT,
             TileSide::RIGHT => TileSide::LEFT,
-            TileSide::NONE => TileSide::NONE,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PieceCategory {
     Generator,
@@ -171,9 +165,21 @@ pub enum PieceCategory {
     Connector,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PieceSemanticKind {
+    Literal,
+    Operator,
+    Construct,
+    Intrinsic,
+    Trick,
+    Output,
+    Connector,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::TileSide;
+    use super::{PieceCategory, PieceSemanticKind, TileSide};
 
     #[test]
     fn tile_side_deserializes_legacy_and_typo_variants() {
@@ -215,5 +221,17 @@ mod tests {
             "\"right\""
         );
         assert_eq!(serde_json::to_string(&TileSide::LEFT).unwrap(), "\"left\"");
+    }
+
+    #[test]
+    fn piece_category_and_semantic_kind_serialize_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&PieceCategory::Constant).unwrap(),
+            "\"constant\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PieceSemanticKind::Construct).unwrap(),
+            "\"construct\""
+        );
     }
 }

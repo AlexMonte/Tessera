@@ -1,4 +1,5 @@
-use crate::code_expr::CodeExpr;
+use crate::ast::Expr;
+use crate::backend::{Backend, JsBackend};
 use crate::compiler::{CompileMode, CompileProgram, NodeStateUpdate, compile_graph};
 use crate::diagnostics::{Diagnostic, SemanticResult};
 use crate::graph::{Graph, GraphOp};
@@ -20,12 +21,21 @@ pub trait HostAdapter: Send + Sync {
     /// is invoked.
     fn create_registry(&self) -> PieceRegistry;
 
+    /// Return the rendering backend for this host.
+    ///
+    /// Override to target a different language (e.g. Lua). Default: JavaScript.
+    fn backend(&self) -> &'static dyn Backend {
+        &JsBackend
+    }
+
     /// Render compiled terminal expressions into output strings.
     ///
     /// Override this to change how terminals are combined (e.g. stack, concurrent
-    /// voices, single output). Default: renders each terminal individually.
-    fn render_terminals(&self, terminals: &[CodeExpr]) -> Vec<String> {
-        terminals.iter().map(|expr| expr.render()).collect()
+    /// voices, single output). Default: renders each terminal individually using
+    /// the host's backend.
+    fn render_terminals(&self, terminals: &[Expr]) -> Vec<String> {
+        let backend = self.backend();
+        terminals.iter().map(|expr| backend.render(expr)).collect()
     }
 
     /// Convert node state updates into graph operations for persistence.
@@ -97,7 +107,7 @@ impl<H: HostAdapter> GraphEngine<H> {
     }
 
     /// Render terminal expressions using the host adapter.
-    pub fn render_terminals(&self, terminals: &[CodeExpr]) -> Vec<String> {
+    pub fn render_terminals(&self, terminals: &[Expr]) -> Vec<String> {
         self.adapter.render_terminals(terminals)
     }
 
@@ -125,9 +135,10 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+    use crate::ast::Expr;
     use crate::graph::{Edge, Node};
     use crate::piece::{ParamDef, ParamSchema, Piece, PieceDef, PieceInputs};
-    use crate::types::{EdgeId, PieceCategory, TileSide};
+    use crate::types::{EdgeId, PieceCategory, PieceSemanticKind, TileSide};
 
     struct TestSource {
         def: PieceDef,
@@ -139,6 +150,8 @@ mod tests {
                     id: "test.source".into(),
                     label: "source".into(),
                     category: PieceCategory::Generator,
+                    semantic_kind: PieceSemanticKind::Operator,
+                    namespace: "core".into(),
                     params: vec![],
                     output_type: Some("text".into()),
                     output_side: Some(TileSide::RIGHT),
@@ -151,12 +164,8 @@ mod tests {
         fn def(&self) -> &PieceDef {
             &self.def
         }
-        fn compile(
-            &self,
-            _inputs: &PieceInputs,
-            _inline_params: &BTreeMap<String, Value>,
-        ) -> CodeExpr {
-            CodeExpr::Literal(Value::String("bd".into()))
+        fn compile(&self, _inputs: &PieceInputs, _inline_params: &BTreeMap<String, Value>) -> Expr {
+            Expr::str_lit("bd")
         }
     }
 
@@ -170,6 +179,8 @@ mod tests {
                     id: "test.output".into(),
                     label: "output".into(),
                     category: PieceCategory::Output,
+                    semantic_kind: PieceSemanticKind::Output,
+                    namespace: "core".into(),
                     params: vec![ParamDef {
                         id: "pattern".into(),
                         label: "pattern".into(),
@@ -193,15 +204,11 @@ mod tests {
         fn def(&self) -> &PieceDef {
             &self.def
         }
-        fn compile(
-            &self,
-            inputs: &PieceInputs,
-            _inline_params: &BTreeMap<String, Value>,
-        ) -> CodeExpr {
+        fn compile(&self, inputs: &PieceInputs, _inline_params: &BTreeMap<String, Value>) -> Expr {
             inputs
                 .get("pattern")
                 .cloned()
-                .unwrap_or_else(|| CodeExpr::Raw("missing".into()))
+                .unwrap_or_else(|| Expr::error("missing"))
         }
     }
 
@@ -236,7 +243,7 @@ mod tests {
                     Node {
                         piece_id: "test.output".into(),
                         inline_params: BTreeMap::new(),
-                        input_sides: BTreeMap::new(),
+                        input_sides: BTreeMap::from([("pattern".into(), TileSide::LEFT)]),
                         output_side: None,
                         label: None,
                         node_state: None,

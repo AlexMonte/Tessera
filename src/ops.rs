@@ -271,17 +271,17 @@ pub fn pick_target_param_for_edge(
         // Suggest moving source to the first open adjacent position with a compatible param.
         let mut suggestions = Vec::new();
         for param in &base.to_piece_def.params {
-            let param_side = node_param_side(base.to_node_ref, param.id.as_str(), param.side);
-            if param_side == TileSide::NONE {
+            if let Some(param_side) = node_param_side(base.to_node_ref, param.id.as_str()) {
+                let adj = adjacent_in_direction(to_node, Some(param_side));
+                if adj != *to_node && !graph.nodes.contains_key(&adj) {
+                    suggestions.push(RepairSuggestion::MoveNode {
+                        node: from.clone(),
+                        to: adj,
+                    });
+                    break;
+                }
+            } else {
                 continue;
-            }
-            let adj = adjacent_in_direction(to_node, &param_side);
-            if adj != *to_node && !graph.nodes.contains_key(&adj) {
-                suggestions.push(RepairSuggestion::MoveNode {
-                    node: from.clone(),
-                    to: adj,
-                });
-                break;
             }
         }
         return EdgeTargetParamProbe::reject_with(
@@ -302,7 +302,9 @@ pub fn pick_target_param_for_edge(
     let mut saw_side_candidate = false;
     let mut saw_open_side_candidate = false;
     for param in &base.to_piece_def.params {
-        let param_side = node_param_side(base.to_node_ref, param.id.as_str(), param.side);
+        let Some(param_side) = node_param_side(base.to_node_ref, param.id.as_str()) else {
+            continue;
+        };
         if param_side != target_side {
             continue;
         }
@@ -349,7 +351,7 @@ pub fn pick_target_param_for_edge(
             .to_piece_def
             .params
             .iter()
-            .filter(|p| node_param_side(base.to_node_ref, p.id.as_str(), p.side) == target_side)
+            .filter(|p| node_param_side(base.to_node_ref, p.id.as_str()) == Some(target_side))
             .filter_map(|p| {
                 graph
                     .edges
@@ -397,8 +399,22 @@ pub fn validate_edge_connect(
         ));
     };
 
-    let target_side = node_param_side(base.to_node_ref, to_param, param_def.side);
-    let expected = adjacent_in_direction(to_node, &target_side);
+    let Some(target_side) = node_param_side(base.to_node_ref, to_param) else {
+        let suggestions = side_from_to_node(to_node, from)
+            .into_iter()
+            .map(|side| RepairSuggestion::SetParamSide {
+                position: to_node.clone(),
+                param_id: to_param.to_string(),
+                side,
+            })
+            .collect();
+        return Err(EdgeTargetParamProbe::reject_with(
+            EdgeConnectProbeReason::NoParamOnTargetSide,
+            format!("target param '{}' has no assigned side", to_param),
+            suggestions,
+        ));
+    };
+    let expected = adjacent_in_direction(to_node, Some(target_side));
     if expected != *from {
         return Err(EdgeTargetParamProbe::reject_with(
             EdgeConnectProbeReason::NotAdjacent,
@@ -464,7 +480,7 @@ fn edge_is_still_adjacent(edge: &Edge, graph: &Graph, registry: &PieceRegistry) 
     let Some(target_piece) = registry.get(target_node.piece_id.as_str()) else {
         return true;
     };
-    let Some(param_def) = target_piece
+    let Some(_param_def) = target_piece
         .def()
         .params
         .iter()
@@ -472,15 +488,15 @@ fn edge_is_still_adjacent(edge: &Edge, graph: &Graph, registry: &PieceRegistry) 
     else {
         return true;
     };
-    let expected = adjacent_in_direction(
-        &edge.to_node,
-        &node_param_side(target_node, edge.to_param.as_str(), param_def.side),
-    );
+    let Some(target_side) = node_param_side(target_node, edge.to_param.as_str()) else {
+        return false;
+    };
+    let expected = adjacent_in_direction(&edge.to_node, Some(target_side));
     expected == edge.from
 }
 
-fn node_param_side(node: &Node, param_id: &str, fallback: TileSide) -> TileSide {
-    node.input_sides.get(param_id).copied().unwrap_or(fallback)
+fn node_param_side(node: &Node, param_id: &str) -> Option<TileSide> {
+    node.input_sides.get(param_id).copied()
 }
 
 fn node_output_side(node: &Node, piece: &PieceDef) -> Option<TileSide> {
@@ -503,19 +519,20 @@ fn edge_is_still_valid(edge: &Edge, graph: &Graph, registry: &PieceRegistry) -> 
     else {
         return false;
     };
-    let target_side = node_param_side(base.to_node_ref, edge.to_param.as_str(), param_def.side);
-    if target_side == TileSide::NONE {
-        return false;
+    if let Some(target_side) = node_param_side(base.to_node_ref, edge.to_param.as_str()) {
+        let expected = adjacent_in_direction(&edge.to_node, Some(target_side));
+        if expected != edge.from {
+            return false;
+        }
+        let Ok(source_output_type) =
+            source_output_type_for_target_side(&base, &edge.from, target_side)
+        else {
+            return false;
+        };
+        param_def.schema.accepts(&source_output_type)
+    } else {
+        false
     }
-    let expected = adjacent_in_direction(&edge.to_node, &target_side);
-    if expected != edge.from {
-        return false;
-    }
-    let Ok(source_output_type) = source_output_type_for_target_side(&base, &edge.from, target_side)
-    else {
-        return false;
-    };
-    param_def.schema.accepts(&source_output_type)
 }
 
 fn prune_invalid_edges_for_node(
@@ -587,31 +604,30 @@ fn auto_wire_node(
         {
             continue;
         }
-        let target_side = node_param_side(&node_snapshot, param.id.as_str(), param.side);
-        if target_side == TileSide::NONE {
+        if let Some(target_side) = node_param_side(&node_snapshot, param.id.as_str()) {
+            let source_pos = adjacent_in_direction(position, Some(target_side));
+            if source_pos == *position || !graph.nodes.contains_key(&source_pos) {
+                continue;
+            }
+            if validate_edge_connect(graph, registry, &source_pos, position, param.id.as_str())
+                .is_ok()
+            {
+                let edge = Edge {
+                    id: EdgeId::new(),
+                    from: source_pos,
+                    to_node: position.clone(),
+                    to_param: param.id.clone(),
+                };
+                graph.edges.insert(edge.id.clone(), edge.clone());
+                added_edges.push(edge);
+            }
+        } else {
             continue;
-        }
-        let source_pos = adjacent_in_direction(position, &target_side);
-        if source_pos == *position || !graph.nodes.contains_key(&source_pos) {
-            continue;
-        }
-        if validate_edge_connect(graph, registry, &source_pos, position, param.id.as_str()).is_ok()
-        {
-            let edge = Edge {
-                id: EdgeId::new(),
-                from: source_pos,
-                to_node: position.clone(),
-                to_param: param.id.clone(),
-            };
-            graph.edges.insert(edge.id.clone(), edge.clone());
-            added_edges.push(edge);
         }
     }
 
-    if let Some(output_side) = node_output_side(&node_snapshot, piece.def())
-        && output_side != TileSide::NONE
-    {
-        let target_pos = adjacent_in_direction(position, &output_side);
+    if let Some(output_side) = node_output_side(&node_snapshot, piece.def()) {
+        let target_pos = adjacent_in_direction(position, Some(output_side));
         if target_pos != *position && graph.nodes.contains_key(&target_pos) {
             let probe = probe_edge_connect(graph, registry, position, &target_pos, None);
             if let Some(to_param) = probe.to_param {
@@ -1486,13 +1502,13 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::code_expr::CodeExpr;
+    use crate::ast::Expr;
     use crate::diagnostics::DiagnosticKind;
     use crate::piece::{
         ParamDef, ParamInlineMode, ParamSchema, ParamValueKind, Piece, PieceDef, PieceInputs,
     };
     use crate::piece_registry::PieceRegistry;
-    use crate::types::{EdgeId, PieceCategory, PortType, TileSide};
+    use crate::types::{EdgeId, PieceCategory, PieceSemanticKind, PortType, TileSide};
 
     struct TestPiece {
         def: PieceDef,
@@ -1508,7 +1524,7 @@ mod tests {
             value_kind: ParamValueKind::Text,
             default: None,
             can_inline: false,
-            inline_mode: ParamInlineMode::Raw,
+            inline_mode: ParamInlineMode::Ident,
             min: None,
             max: None,
         }
@@ -1521,6 +1537,8 @@ mod tests {
                     id: id.to_string(),
                     label: id.to_string(),
                     category: PieceCategory::Generator,
+                    semantic_kind: PieceSemanticKind::Intrinsic,
+                    namespace: "strudel".into(),
                     params: vec![ParamDef {
                         id: "value".to_string(),
                         label: "value".to_string(),
@@ -1546,6 +1564,8 @@ mod tests {
                     id: id.to_string(),
                     label: id.to_string(),
                     category: PieceCategory::Transform,
+                    semantic_kind: PieceSemanticKind::Intrinsic,
+                    namespace: "strudel".into(),
                     params: vec![ParamDef {
                         id: "pattern".to_string(),
                         label: "pattern".to_string(),
@@ -1568,6 +1588,8 @@ mod tests {
                     id: id.to_string(),
                     label: id.to_string(),
                     category: PieceCategory::Output,
+                    semantic_kind: PieceSemanticKind::Output,
+                    namespace: "strudel".into(),
                     params: vec![ParamDef {
                         id: "pattern".to_string(),
                         label: "pattern".to_string(),
@@ -1590,12 +1612,8 @@ mod tests {
             &self.def
         }
 
-        fn compile(
-            &self,
-            _inputs: &PieceInputs,
-            _inline_params: &BTreeMap<String, Value>,
-        ) -> CodeExpr {
-            CodeExpr::Raw(self.def.id.clone())
+        fn compile(&self, _inputs: &PieceInputs, _inline_params: &BTreeMap<String, Value>) -> Expr {
+            Expr::ident(self.def.id.clone())
         }
     }
 
@@ -1628,7 +1646,7 @@ mod tests {
             Node {
                 piece_id: "strudel.fast".to_string(),
                 inline_params: BTreeMap::new(),
-                input_sides: BTreeMap::new(),
+                input_sides: BTreeMap::from([("pattern".to_string(), TileSide::LEFT)]),
                 output_side: None,
                 label: None,
                 node_state: None,
@@ -1639,7 +1657,7 @@ mod tests {
             Node {
                 piece_id: "strudel.output".to_string(),
                 inline_params: BTreeMap::new(),
-                input_sides: BTreeMap::new(),
+                input_sides: BTreeMap::from([("pattern".to_string(), TileSide::LEFT)]),
                 output_side: None,
                 label: None,
                 node_state: None,
@@ -1837,7 +1855,7 @@ mod tests {
             Node {
                 piece_id: "strudel.fast".to_string(),
                 inline_params: BTreeMap::new(),
-                input_sides: BTreeMap::new(),
+                input_sides: BTreeMap::from([("pattern".to_string(), TileSide::LEFT)]),
                 output_side: None,
                 label: None,
                 node_state: None,
@@ -1848,7 +1866,7 @@ mod tests {
             Node {
                 piece_id: "strudel.output".to_string(),
                 inline_params: BTreeMap::new(),
-                input_sides: BTreeMap::new(),
+                input_sides: BTreeMap::from([("pattern".to_string(), TileSide::LEFT)]),
                 output_side: None,
                 label: None,
                 node_state: None,
@@ -1893,7 +1911,7 @@ mod tests {
     }
 
     #[test]
-    fn node_auto_wire_removes_invalid_edge_and_respects_none_side() {
+    fn node_auto_wire_removes_invalid_edge_when_param_side_is_unassigned() {
         let registry = sample_registry();
         let edge = Edge {
             id: EdgeId::new(),
@@ -1922,7 +1940,7 @@ mod tests {
                     Node {
                         piece_id: "strudel.fast".to_string(),
                         inline_params: BTreeMap::new(),
-                        input_sides: BTreeMap::from([("pattern".to_string(), TileSide::NONE)]),
+                        input_sides: BTreeMap::new(),
                         output_side: None,
                         label: None,
                         node_state: None,

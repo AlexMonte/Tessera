@@ -1,7 +1,12 @@
 //! Tessera: a host-agnostic typed graph engine for visual music/program editors.
+//!
+//! Architectural rule: target-specific AST adaptation belongs in host/target
+//! layers. The core library stays target-agnostic.
 
-pub mod code_expr;
+pub mod ast;
+pub mod backend;
 pub mod compiler;
+pub mod core_pieces;
 pub mod diagnostics;
 pub mod graph;
 pub mod host;
@@ -12,8 +17,13 @@ pub mod semantic;
 pub mod subgraph;
 pub mod types;
 
-pub use code_expr::CodeExpr;
+pub use ast::{
+    BinOp, Expr, ExprKind, Lit, Origin, StringSyntax, UnaryOp, is_valid_ident_path,
+    is_valid_ident_segment, parse_ident_path,
+};
+pub use backend::{Backend, JsBackend, LuaBackend};
 pub use compiler::{CompileMode, CompileProgram, NodeStateUpdate, compile_graph};
+pub use core_pieces::core_expression_pieces;
 pub use diagnostics::{Diagnostic, DiagnosticKind, DiagnosticSeverity, SemanticResult};
 pub use graph::{Edge, Graph, GraphOp, GraphOpRecord, Node, ProjectDocument};
 pub use host::{GraphEngine, HostAdapter};
@@ -32,4 +42,6 @@ pub use subgraph::{
     SubgraphOutputPiece, SubgraphSignature, analyze_subgraph, compile_subgraph, compile_subgraphs,
     subgraph_editor_pieces, subgraph_pieces,
 };
-pub use types::{EdgeId, GridPos, PieceCategory, PortType, TileSide, adjacent_in_direction};
+pub use types::{
+    EdgeId, GridPos, PieceCategory, PieceSemanticKind, PortType, TileSide, adjacent_in_direction,
+};

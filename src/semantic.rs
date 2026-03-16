@@ -19,8 +19,8 @@ pub(crate) fn incoming_edge_for_param<'a>(
         .find(|edge| &edge.to_node == to_node && edge.to_param == param)
 }
 
-fn node_param_side(node: &Node, param_id: &str, fallback: TileSide) -> TileSide {
-    node.input_sides.get(param_id).copied().unwrap_or(fallback)
+fn node_param_side(node: &Node, param_id: &str) -> Option<TileSide> {
+    node.input_sides.get(param_id).copied()
 }
 
 fn node_output_side(node: &Node, piece: &PieceDef) -> Option<TileSide> {
@@ -110,8 +110,22 @@ pub fn semantic_pass(graph: &Graph, registry: &PieceRegistry) -> SemanticResult 
             continue;
         };
 
-        let target_side = node_param_side(to_node, edge.to_param.as_str(), param_def.side);
-        let expected_neighbor = adjacent_in_direction(&edge.to_node, &target_side);
+        let Some(target_side) = node_param_side(to_node, edge.to_param.as_str()) else {
+            diagnostics.push(
+                Diagnostic::error(
+                    DiagnosticKind::InvalidOperation {
+                        reason: format!(
+                            "target param '{}' has no assigned side on placed node",
+                            edge.to_param
+                        ),
+                    },
+                    Some(edge.to_node),
+                )
+                .with_edge(edge.id.clone()),
+            );
+            continue;
+        };
+        let expected_neighbor = adjacent_in_direction(&edge.to_node, Some(target_side));
         if expected_neighbor != edge.from {
             diagnostics.push(
                 Diagnostic::error(

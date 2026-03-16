@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::code_expr::CodeExpr;
+use crate::ast::{Expr, Origin};
 use crate::compiler::{CompileMode, compile_node_expr};
 use crate::diagnostics::{Diagnostic, DiagnosticKind};
 use crate::graph::Graph;
@@ -12,7 +12,7 @@ use crate::piece::{
 };
 use crate::piece_registry::PieceRegistry;
 use crate::semantic::semantic_pass;
-use crate::types::{GridPos, PieceCategory, PortType, TileSide};
+use crate::types::{GridPos, PieceCategory, PieceSemanticKind, PortType, TileSide};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -82,7 +82,7 @@ pub struct CompiledSubgraph {
     pub display_name: String,
     pub binding_name: String,
     pub signature: SubgraphSignature,
-    pub body: CodeExpr,
+    pub body: Expr,
 }
 
 impl CompiledSubgraph {
@@ -120,6 +120,8 @@ impl SubgraphInputPiece {
                 id: id.into(),
                 label: format!("arg{slot}"),
                 category: PieceCategory::Trick,
+                semantic_kind: PieceSemanticKind::Trick,
+                namespace: "core".into(),
                 params: vec![
                     ParamDef {
                         id: "label".into(),
@@ -205,8 +207,8 @@ impl Piece for SubgraphInputPiece {
         &self.def
     }
 
-    fn compile(&self, _inputs: &PieceInputs, _inline_params: &BTreeMap<String, Value>) -> CodeExpr {
-        CodeExpr::Ident(format!("arg{}", self.slot))
+    fn compile(&self, _inputs: &PieceInputs, _inline_params: &BTreeMap<String, Value>) -> Expr {
+        Expr::ident(format!("arg{}", self.slot))
     }
 }
 
@@ -222,6 +224,8 @@ impl SubgraphOutputPiece {
                 id: SUBGRAPH_OUTPUT_ID.into(),
                 label: "return".into(),
                 category: PieceCategory::Output,
+                semantic_kind: PieceSemanticKind::Output,
+                namespace: "core".into(),
                 params: vec![ParamDef {
                     id: "input".into(),
                     label: "input".into(),
@@ -255,11 +259,11 @@ impl Piece for SubgraphOutputPiece {
         &self.def
     }
 
-    fn compile(&self, inputs: &PieceInputs, _inline_params: &BTreeMap<String, Value>) -> CodeExpr {
+    fn compile(&self, inputs: &PieceInputs, _inline_params: &BTreeMap<String, Value>) -> Expr {
         inputs
             .get("input")
             .cloned()
-            .unwrap_or_else(|| CodeExpr::Raw("/* missing subgraph output */".into()))
+            .unwrap_or_else(|| Expr::error("missing subgraph output"))
     }
 }
 
@@ -287,6 +291,8 @@ impl GeneratedSubgraphPiece {
                 id: format!("tessera.subgraph.{subgraph_id}"),
                 label: label.into(),
                 category: PieceCategory::Trick,
+                semantic_kind: PieceSemanticKind::Trick,
+                namespace: "user".into(),
                 params,
                 output_type: Some(PortType::any()),
                 output_side: Some(TileSide::RIGHT),
@@ -303,9 +309,9 @@ impl Piece for GeneratedSubgraphPiece {
         &self.def
     }
 
-    fn compile(&self, inputs: &PieceInputs, inline_params: &BTreeMap<String, Value>) -> CodeExpr {
+    fn compile(&self, inputs: &PieceInputs, inline_params: &BTreeMap<String, Value>) -> Expr {
         if self.ordered_inputs.is_empty() {
-            return CodeExpr::Ident(self.binding_name.clone());
+            return Expr::ident(self.binding_name.clone());
         }
 
         let resolved: Vec<_> = self
@@ -321,29 +327,36 @@ impl Piece for GeneratedSubgraphPiece {
                     .iter()
                     .any(|r| !r.input.is_receiver && r.is_explicit);
                 if !has_explicit_partial {
-                    return CodeExpr::Ident(self.binding_name.clone());
+                    return Expr::ident(self.binding_name.clone());
                 }
+                // Build a structural lambda for partial application.
                 let placeholder = "pattern";
-                let args = render_call_args_string(resolved.iter().map(|r| {
-                    if r.input.is_receiver {
-                        Some(CodeExpr::Ident(placeholder.into()))
-                    } else {
-                        r.expr.clone()
-                    }
-                }));
-                return CodeExpr::Raw(format!("{placeholder} => {}({args})", self.binding_name));
+                let lambda_args: Vec<Expr> = resolved
+                    .iter()
+                    .map(|r| {
+                        if r.input.is_receiver {
+                            Expr::ident(placeholder)
+                        } else {
+                            r.expr.clone().unwrap_or_else(Expr::nil)
+                        }
+                    })
+                    .collect();
+                return Expr::lambda(
+                    vec![placeholder.into()],
+                    Expr::call_named(&self.binding_name, lambda_args),
+                );
             }
         }
 
-        CodeExpr::Call {
-            func: self.binding_name.clone(),
-            args: strip_trailing_none(
+        Expr::call_named(
+            &self.binding_name,
+            strip_trailing_none(
                 resolved
                     .into_iter()
                     .map(|r| r.expr)
-                    .collect::<Vec<Option<CodeExpr>>>(),
+                    .collect::<Vec<Option<Expr>>>(),
             ),
-        }
+        )
     }
 }
 
@@ -521,7 +534,13 @@ pub fn compile_subgraph(
 
     let mut overrides = BTreeMap::new();
     for input in &signature.inputs {
-        overrides.insert(input.pos.clone(), CodeExpr::Ident(input.param_name()));
+        overrides.insert(
+            input.pos.clone(),
+            Expr::ident(input.param_name()).with_origin(Origin {
+                node: input.pos.clone(),
+                param: Some(format!("arg{}", input.slot)),
+            }),
+        );
     }
 
     let body = match compile_node_expr(
@@ -576,7 +595,13 @@ pub fn compile_subgraphs(
 
         let mut overrides = BTreeMap::new();
         for input in &signature.inputs {
-            overrides.insert(input.pos.clone(), CodeExpr::Ident(input.param_name()));
+            overrides.insert(
+                input.pos.clone(),
+                Expr::ident(input.param_name()).with_origin(Origin {
+                    node: input.pos.clone(),
+                    param: Some(format!("arg{}", input.slot)),
+                }),
+            );
         }
 
         let body = match compile_node_expr(
@@ -696,13 +721,19 @@ fn can_inline_for_port(port_type: &PortType) -> bool {
     matches!(port_type.as_str(), "number" | "text" | "bool")
 }
 
-pub fn default_expr_for_input(input: &SubgraphInput) -> Option<CodeExpr> {
+pub fn default_expr_for_input(input: &SubgraphInput) -> Option<Expr> {
     schema_for_port(
         &input.port_type,
         input.default_value.clone(),
         can_inline_for_port(&input.port_type),
     )
     .default_expr()
+    .map(|expr| {
+        expr.with_origin_if_missing(Origin {
+            node: input.pos.clone(),
+            param: Some(format!("arg{}", input.slot)),
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -712,7 +743,7 @@ pub fn default_expr_for_input(input: &SubgraphInput) -> Option<CodeExpr> {
 #[derive(Clone)]
 struct ResolvedInput<'a> {
     input: &'a SubgraphInput,
-    expr: Option<CodeExpr>,
+    expr: Option<Expr>,
     is_explicit: bool,
 }
 
@@ -739,22 +770,14 @@ fn resolve_input<'a>(
     }
 }
 
-fn strip_trailing_none(args: Vec<Option<CodeExpr>>) -> Vec<CodeExpr> {
+fn strip_trailing_none(args: Vec<Option<Expr>>) -> Vec<Expr> {
     let mut args = args;
     while matches!(args.last(), Some(None)) {
         args.pop();
     }
     args.into_iter()
-        .map(|v| v.unwrap_or_else(|| CodeExpr::Ident("undefined".into())))
+        .map(|v| v.unwrap_or_else(Expr::nil))
         .collect()
-}
-
-fn render_call_args_string(args: impl IntoIterator<Item = Option<CodeExpr>>) -> String {
-    strip_trailing_none(args.into_iter().collect())
-        .into_iter()
-        .map(|a| a.render())
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 // ---------------------------------------------------------------------------
@@ -820,6 +843,8 @@ fn sanitize_identifier(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::ExprKind;
+    use crate::backend::{Backend, JsBackend};
     use crate::graph::{Edge, Node};
     use crate::types::EdgeId;
 
@@ -844,18 +869,24 @@ mod tests {
     fn input_piece_compiles_to_ident() {
         let piece = SubgraphInputPiece::new(2);
         let expr = piece.compile(&PieceInputs::default(), &BTreeMap::new());
-        assert_eq!(expr.render(), "arg2");
+        assert_eq!(JsBackend.render(&expr), "arg2");
     }
 
     #[test]
     fn output_piece_passes_through() {
         let piece = SubgraphOutputPiece::new();
         let mut inputs = PieceInputs::default();
-        inputs
-            .scalar
-            .insert("input".into(), CodeExpr::Ident("x".into()));
+        inputs.scalar.insert("input".into(), Expr::ident("x"));
         let expr = piece.compile(&inputs, &BTreeMap::new());
-        assert_eq!(expr.render(), "x");
+        assert_eq!(JsBackend.render(&expr), "x");
+    }
+
+    #[test]
+    fn output_piece_uses_error_placeholder_when_missing() {
+        let piece = SubgraphOutputPiece::new();
+        let expr = piece.compile(&PieceInputs::default(), &BTreeMap::new());
+        assert!(matches!(expr.kind, ExprKind::Error { .. }));
+        assert_eq!(JsBackend.render(&expr), "/* missing subgraph output */");
     }
 
     // -- GeneratedSubgraphPiece --
@@ -864,7 +895,7 @@ mod tests {
     fn zero_input_compiles_to_ident() {
         let piece = GeneratedSubgraphPiece::new("my_sub", "my sub", "my_sub", &[]);
         let expr = piece.compile(&PieceInputs::default(), &BTreeMap::new());
-        assert_eq!(expr.render(), "my_sub");
+        assert_eq!(JsBackend.render(&expr), "my_sub");
     }
 
     #[test]
@@ -872,7 +903,7 @@ mod tests {
         let piece =
             GeneratedSubgraphPiece::new("fx", "fx", "fx", &[make_input(1, "any", true, true)]);
         let expr = piece.compile(&PieceInputs::default(), &BTreeMap::new());
-        assert_eq!(expr.render(), "fx");
+        assert_eq!(JsBackend.render(&expr), "fx");
     }
 
     #[test]
@@ -880,11 +911,10 @@ mod tests {
         let piece =
             GeneratedSubgraphPiece::new("fx", "fx", "fx", &[make_input(1, "any", true, true)]);
         let mut inputs = PieceInputs::default();
-        inputs
-            .scalar
-            .insert("arg1".into(), CodeExpr::Ident("src".into()));
+        inputs.scalar.insert("arg1".into(), Expr::ident("src"));
         let expr = piece.compile(&inputs, &BTreeMap::new());
-        assert_eq!(expr.render(), "fx(src)");
+        assert!(matches!(expr.kind, ExprKind::Call { .. }));
+        assert_eq!(JsBackend.render(&expr), "fx(src)");
     }
 
     #[test]
@@ -899,12 +929,19 @@ mod tests {
             ],
         );
         let mut inputs = PieceInputs::default();
-        inputs.scalar.insert(
-            "arg2".into(),
-            CodeExpr::Literal(Value::Number(serde_json::Number::from_f64(0.5).unwrap())),
-        );
+        inputs.scalar.insert("arg2".into(), Expr::float(0.5));
         let expr = piece.compile(&inputs, &BTreeMap::new());
-        assert_eq!(expr.render(), "pattern => shimmer(pattern, 0.5)");
+        assert!(matches!(expr.kind, ExprKind::Lambda { .. }));
+        assert_eq!(
+            JsBackend.render(&expr),
+            "(pattern) => shimmer(pattern, 0.5)"
+        );
+    }
+
+    #[test]
+    fn strip_trailing_none_replaces_internal_gaps_with_nil() {
+        let args = strip_trailing_none(vec![Some(Expr::ident("src")), None, Some(Expr::int(2))]);
+        assert_eq!(args, vec![Expr::ident("src"), Expr::nil(), Expr::int(2)]);
     }
 
     // -- analyze_subgraph --
@@ -930,6 +967,8 @@ mod tests {
                     id: "test.transform".into(),
                     label: "xform".into(),
                     category: PieceCategory::Transform,
+                    semantic_kind: PieceSemanticKind::Operator,
+                    namespace: "core".into(),
                     params: vec![ParamDef {
                         id: "input".into(),
                         label: "input".into(),
@@ -958,21 +997,15 @@ mod tests {
         fn def(&self) -> &PieceDef {
             &self.def
         }
-        fn compile(
-            &self,
-            inputs: &PieceInputs,
-            _inline_params: &BTreeMap<String, Value>,
-        ) -> CodeExpr {
-            CodeExpr::Method {
-                receiver: Box::new(
-                    inputs
-                        .get("input")
-                        .cloned()
-                        .unwrap_or_else(|| CodeExpr::Raw("missing".into())),
-                ),
-                method: "xform".into(),
-                args: vec![],
-            }
+        fn compile(&self, inputs: &PieceInputs, _inline_params: &BTreeMap<String, Value>) -> Expr {
+            Expr::method_call(
+                inputs
+                    .get("input")
+                    .cloned()
+                    .unwrap_or_else(|| Expr::error("missing")),
+                "xform",
+                vec![],
+            )
         }
     }
 
@@ -1004,7 +1037,7 @@ mod tests {
                     Node {
                         piece_id: "test.transform".into(),
                         inline_params: BTreeMap::new(),
-                        input_sides: BTreeMap::new(),
+                        input_sides: BTreeMap::from([("input".into(), TileSide::LEFT)]),
                         output_side: None,
                         label: None,
                         node_state: None,
@@ -1015,7 +1048,7 @@ mod tests {
                     Node {
                         piece_id: SUBGRAPH_OUTPUT_ID.into(),
                         inline_params: BTreeMap::new(),
-                        input_sides: BTreeMap::new(),
+                        input_sides: BTreeMap::from([("input".into(), TileSide::LEFT)]),
                         output_side: None,
                         label: None,
                         node_state: None,
@@ -1068,6 +1101,6 @@ mod tests {
             graph,
         };
         let compiled = compile_subgraph(&def, &reg).expect("compile");
-        assert_eq!(compiled.body.render(), "src.xform()");
+        assert_eq!(JsBackend.render(&compiled.body), "src.xform()");
     }
 }

@@ -15,8 +15,11 @@ pub struct Node {
     /// Inline parameter values owned directly by this node instance.
     #[serde(default)]
     pub inline_params: BTreeMap<String, Value>,
-    /// Per-param side overrides applied by the editor.
-    #[serde(default)]
+    /// Per-param side assignments applied to this placed node.
+    ///
+    /// Missing entries mean the param is currently unassigned. Legacy `null`
+    /// entries deserialize as missing assignments.
+    #[serde(default, deserialize_with = "input_sides_serde::deserialize")]
     pub input_sides: BTreeMap<String, TileSide>,
     /// Optional output-side override applied by the editor.
     #[serde(default)]
@@ -173,12 +176,71 @@ mod grid_nodes_serde {
     }
 }
 
+mod input_sides_serde {
+    use crate::types::TileSide;
+    use serde::Deserialize;
+    use serde::Deserializer;
+    use std::collections::BTreeMap;
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<String, TileSide>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = BTreeMap::<String, Option<TileSide>>::deserialize(deserializer)?;
+        Ok(raw
+            .into_iter()
+            .filter_map(|(param, side)| side.map(|side| (param, side)))
+            .collect())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Legacy standalone project document retained for schema-v2 migration.
 pub struct ProjectDocument {
     pub schema_version: u32,
     pub name: String,
     pub graph: Graph,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GraphOp, Node};
+    use crate::types::{GridPos, TileSide};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn node_input_sides_drop_legacy_null_entries() {
+        let node: Node = serde_json::from_value(json!({
+            "piece_id": "test.node",
+            "inline_params": {},
+            "input_sides": {
+                "left": "left",
+                "pattern": null
+            },
+            "output_side": null,
+            "label": null,
+            "node_state": null
+        }))
+        .expect("deserialize node");
+
+        assert_eq!(
+            node.input_sides,
+            BTreeMap::from([("left".into(), TileSide::LEFT)])
+        );
+    }
+
+    #[test]
+    fn param_set_side_serializes_without_nullable_side() {
+        let op = GraphOp::ParamSetSide {
+            position: GridPos { col: 1, row: 2 },
+            param_id: "pattern".into(),
+            side: TileSide::LEFT,
+        };
+
+        let value = serde_json::to_value(op).expect("serialize op");
+        assert_eq!(value.get("side"), Some(&json!("left")));
+    }
 }
 
 impl ProjectDocument {
