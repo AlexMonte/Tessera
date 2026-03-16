@@ -419,7 +419,16 @@ impl Expr {
                 if let Some(i) = n.as_i64() {
                     Expr::int(i)
                 } else if let Some(u) = n.as_u64() {
-                    // u64 > i64::MAX: convert to float with potential precision loss
+                    // u64 that didn't fit in i64 — precision may be lost in f64
+                    // representation. All current scripting targets (JS, Lua, Python)
+                    // use f64 for JSON numbers anyway, so this is semantically correct
+                    // even if not bit-exact.
+                    #[cfg(debug_assertions)]
+                    if u as f64 as u64 != u {
+                        eprintln!(
+                            "tessera: precision loss converting {u} to f64 in from_json_value"
+                        );
+                    }
                     Expr::float(u as f64)
                 } else {
                     Expr::float(n.as_f64().unwrap_or(0.0))

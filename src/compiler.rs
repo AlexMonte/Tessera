@@ -5,8 +5,8 @@ use serde_json::Value;
 
 use crate::ast::{Expr, ExprKind, Origin};
 use crate::diagnostics::{Diagnostic, DiagnosticKind, SemanticResult};
-use crate::graph::Graph;
-use crate::piece::PieceInputs;
+use crate::graph::{Graph, Node};
+use crate::piece::{Piece, PieceInputs};
 use crate::piece_registry::PieceRegistry;
 use crate::semantic::incoming_edge_for_param;
 use crate::types::{EdgeId, GridPos, TileSide};
@@ -47,14 +47,14 @@ fn error(kind: DiagnosticKind, site: Option<GridPos>, edge_id: Option<EdgeId>) -
 
 fn node_origin(pos: &GridPos) -> Origin {
     Origin {
-        node: pos.clone(),
+        node: *pos,
         param: None,
     }
 }
 
 fn param_origin(pos: &GridPos, param: &str) -> Origin {
     Origin {
-        node: pos.clone(),
+        node: *pos,
         param: Some(param.to_string()),
     }
 }
@@ -65,7 +65,7 @@ fn unresolved_error_diagnostic(expr: &Expr, fallback: &GridPos) -> Diagnostic {
             DiagnosticKind::InvalidOperation {
                 reason: "terminal expression contains unresolved error placeholder".into(),
             },
-            Some(fallback.clone()),
+            Some(*fallback),
             None,
         );
     };
@@ -77,8 +77,8 @@ fn unresolved_error_diagnostic(expr: &Expr, fallback: &GridPos) -> Diagnostic {
     let site = error_expr
         .origin
         .as_ref()
-        .map(|origin| origin.node.clone())
-        .or_else(|| Some(fallback.clone()));
+        .map(|origin| origin.node)
+        .or(Some(*fallback));
 
     error(
         DiagnosticKind::InvalidOperation {
@@ -102,9 +102,9 @@ pub fn compile_graph(
         let Some(expr) = compiled_nodes.compiled.get(terminal).cloned() else {
             return Err(vec![error(
                 DiagnosticKind::UnknownNode {
-                    pos: terminal.clone(),
+                    pos: *terminal,
                 },
-                Some(terminal.clone()),
+                Some(*terminal),
                 None,
             )]);
         };
@@ -134,8 +134,8 @@ pub fn compile_node_expr(
     let compiled_nodes = compile_nodes(graph, registry, sem, mode, overrides)?;
     let Some(expr) = compiled_nodes.compiled.get(root).cloned() else {
         return Err(vec![error(
-            DiagnosticKind::UnknownNode { pos: root.clone() },
-            Some(root.clone()),
+            DiagnosticKind::UnknownNode { pos: *root },
+            Some(*root),
             None,
         )]);
     };
@@ -154,6 +154,128 @@ fn direction_from_to(from: &GridPos, to: &GridPos) -> Option<TileSide> {
     }
 }
 
+/// Resolve all parameter inputs for a single node by checking, in priority
+/// order: connected upstream expression → inline parameter value → schema
+/// default → required-param error.
+fn resolve_param_inputs(
+    piece: &dyn Piece,
+    node: &Node,
+    pos: &GridPos,
+    graph: &Graph,
+    compiled: &BTreeMap<GridPos, Expr>,
+    multi_outputs: &BTreeMap<(GridPos, TileSide), Expr>,
+) -> Result<PieceInputs, Vec<Diagnostic>> {
+    let mut inputs = PieceInputs::default();
+    let mut errors = Vec::<Diagnostic>::new();
+
+    for param in &piece.def().params {
+        let connected =
+            incoming_edge_for_param(graph, pos, param.id.as_str()).and_then(|edge| {
+                direction_from_to(&edge.from, &edge.to_node)
+                    .and_then(|exit_side| multi_outputs.get(&(edge.from, exit_side)))
+                    .or_else(|| compiled.get(&edge.from))
+                    .cloned()
+            });
+
+        let resolved = if let Some(expr) = connected {
+            Some(expr.with_origin_if_missing(param_origin(pos, param.id.as_str())))
+        } else if let Some(value) = node.inline_params.get(param.id.as_str()) {
+            if !param.schema.can_inline() {
+                errors.push(error(
+                    DiagnosticKind::InlineNotAllowed {
+                        param: param.id.clone(),
+                    },
+                    Some(*pos),
+                    None,
+                ));
+                None
+            } else {
+                let Some(expr) = param.schema.inline_expr(value) else {
+                    errors.push(error(
+                        DiagnosticKind::InlineTypeMismatch {
+                            param: param.id.clone(),
+                            expected: param.schema.expected_port_type(),
+                            got_value: value.clone(),
+                        },
+                        Some(*pos),
+                        None,
+                    ));
+                    continue;
+                };
+                Some(expr.with_origin_if_missing(param_origin(pos, param.id.as_str())))
+            }
+        } else if let Some(default_expr) = param.schema.default_expr() {
+            Some(default_expr.with_origin_if_missing(param_origin(pos, param.id.as_str())))
+        } else if param.required {
+            errors.push(error(
+                DiagnosticKind::MissingRequiredParam {
+                    param: param.id.clone(),
+                },
+                Some(*pos),
+                None,
+            ));
+            None
+        } else {
+            None
+        };
+
+        if let Some(expr) = resolved {
+            if let Some(group) = param.variadic_group.as_ref() {
+                inputs
+                    .variadic
+                    .entry(group.clone())
+                    .or_default()
+                    .push(expr.clone());
+            }
+            inputs.scalar.insert(param.id.clone(), expr);
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(inputs)
+    } else {
+        Err(errors)
+    }
+}
+
+/// Compile a single piece, handling the three-way branch for stateful vs
+/// stateless pieces and recording any state transitions.
+fn compile_piece_expr(
+    piece: &dyn Piece,
+    inputs: &PieceInputs,
+    node: &Node,
+    pos: &GridPos,
+    mode: CompileMode,
+) -> (Expr, Option<NodeStateUpdate>) {
+    let (expr, state_update) = if let Some(state) = node.node_state.as_ref() {
+        let (expr, next_state) = piece.compile_stateful(inputs, &node.inline_params, state);
+        let update = if mode == CompileMode::Runtime && &next_state != state {
+            Some(NodeStateUpdate {
+                position: *pos,
+                state: next_state,
+            })
+        } else {
+            None
+        };
+        (expr, update)
+    } else if let Some(initial) = piece.initial_state() {
+        let (expr, next_state) = piece.compile_stateful(inputs, &node.inline_params, &initial);
+        let update = if mode == CompileMode::Runtime {
+            Some(NodeStateUpdate {
+                position: *pos,
+                state: next_state,
+            })
+        } else {
+            None
+        };
+        (expr, update)
+    } else {
+        (piece.compile(inputs, &node.inline_params), None)
+    };
+
+    (expr.with_origin_if_missing(node_origin(pos)), state_update)
+}
+
 fn compile_nodes(
     graph: &Graph,
     registry: &PieceRegistry,
@@ -168,10 +290,7 @@ fn compile_nodes(
     let mut compiled = overrides
         .iter()
         .map(|(pos, expr)| {
-            (
-                pos.clone(),
-                expr.clone().with_origin_if_missing(node_origin(pos)),
-            )
+            (*pos, expr.clone().with_origin_if_missing(node_origin(pos)))
         })
         .collect::<BTreeMap<_, _>>();
     let mut multi_outputs: BTreeMap<(GridPos, TileSide), Expr> = BTreeMap::new();
@@ -185,8 +304,8 @@ fn compile_nodes(
 
         let Some(node) = graph.nodes.get(pos) else {
             compile_errors.push(error(
-                DiagnosticKind::UnknownNode { pos: pos.clone() },
-                Some(pos.clone()),
+                DiagnosticKind::UnknownNode { pos: *pos },
+                Some(*pos),
                 None,
             ));
             continue;
@@ -197,115 +316,44 @@ fn compile_nodes(
                 DiagnosticKind::UnknownPiece {
                     piece_id: node.piece_id.clone(),
                 },
-                Some(pos.clone()),
+                Some(*pos),
                 None,
             ));
             continue;
         };
 
-        let mut inputs = PieceInputs::default();
-
-        for param in &piece.def().params {
-            let connected =
-                incoming_edge_for_param(graph, pos, param.id.as_str()).and_then(|edge| {
-                    direction_from_to(&edge.from, &edge.to_node)
-                        .and_then(|exit_side| multi_outputs.get(&(edge.from.clone(), exit_side)))
-                        .or_else(|| compiled.get(&edge.from))
-                        .cloned()
-                });
-
-            let resolved = if let Some(expr) = connected {
-                Some(expr.with_origin_if_missing(param_origin(pos, param.id.as_str())))
-            } else if let Some(value) = node.inline_params.get(param.id.as_str()) {
-                if !param.schema.can_inline() {
-                    compile_errors.push(error(
-                        DiagnosticKind::InlineNotAllowed {
-                            param: param.id.clone(),
-                        },
-                        Some(pos.clone()),
-                        None,
-                    ));
-                    None
-                } else {
-                    let Some(expr) = param.schema.inline_expr(value) else {
-                        compile_errors.push(error(
-                            DiagnosticKind::InlineTypeMismatch {
-                                param: param.id.clone(),
-                                expected: param.schema.expected_port_type(),
-                                got_value: value.clone(),
-                            },
-                            Some(pos.clone()),
-                            None,
-                        ));
-                        continue;
-                    };
-                    Some(expr.with_origin_if_missing(param_origin(pos, param.id.as_str())))
-                }
-            } else if let Some(default_expr) = param.schema.default_expr() {
-                Some(default_expr.with_origin_if_missing(param_origin(pos, param.id.as_str())))
-            } else if param.required {
-                compile_errors.push(error(
-                    DiagnosticKind::MissingRequiredParam {
-                        param: param.id.clone(),
-                    },
-                    Some(pos.clone()),
-                    None,
-                ));
-                None
-            } else {
-                None
-            };
-
-            if let Some(expr) = resolved {
-                if let Some(group) = param.variadic_group.as_ref() {
-                    inputs
-                        .variadic
-                        .entry(group.clone())
-                        .or_default()
-                        .push(expr.clone());
-                }
-                inputs.scalar.insert(param.id.clone(), expr);
+        let inputs = match resolve_param_inputs(
+            piece.as_ref(),
+            node,
+            pos,
+            graph,
+            &compiled,
+            &multi_outputs,
+        ) {
+            Ok(inputs) => inputs,
+            Err(mut errs) => {
+                compile_errors.append(&mut errs);
+                continue;
             }
-        }
+        };
 
-        if !compile_errors.is_empty() {
-            continue;
-        }
+        let (expr, state_update) = compile_piece_expr(piece.as_ref(), &inputs, node, pos, mode);
 
-        let expr = if let Some(state) = node.node_state.as_ref() {
-            let (expr, next_state) = piece.compile_stateful(&inputs, &node.inline_params, state);
-            if mode == CompileMode::Runtime && &next_state != state {
-                state_updates.push(NodeStateUpdate {
-                    position: pos.clone(),
-                    state: next_state,
-                });
-            }
-            expr
-        } else if let Some(initial) = piece.initial_state() {
-            let (expr, next_state) = piece.compile_stateful(&inputs, &node.inline_params, &initial);
-            if mode == CompileMode::Runtime {
-                state_updates.push(NodeStateUpdate {
-                    position: pos.clone(),
-                    state: next_state,
-                });
-            }
-            expr
-        } else {
-            piece.compile(&inputs, &node.inline_params)
+        if let Some(update) = state_update {
+            state_updates.push(update);
         }
-        .with_origin_if_missing(node_origin(pos));
 
         // Store per-side outputs for multi-output pieces (e.g. cross connectors).
         if let Some(side_exprs) = piece.compile_multi_output(&inputs, &node.inline_params) {
             for (side, side_expr) in side_exprs {
                 multi_outputs.insert(
-                    (pos.clone(), side),
+                    (*pos, side),
                     side_expr.with_origin_if_missing(node_origin(pos)),
                 );
             }
         }
 
-        compiled.insert(pos.clone(), expr);
+        compiled.insert(*pos, expr);
     }
 
     if !compile_errors.is_empty() {
