@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
+use crate::activity::PreviewTimeline;
 use crate::ast::{Expr, parse_ident_path};
 use crate::types::{PieceCategory, PieceSemanticKind, PortType, TileSide};
 
@@ -82,17 +83,25 @@ pub enum ParamSchema {
 impl ParamSchema {
     /// Return whether this parameter can accept a connection of the given port type.
     pub fn accepts(&self, port_type: &PortType) -> bool {
+        self.resolve_connection(port_type).is_ok()
+    }
+
+    pub(crate) fn resolve_connection(
+        &self,
+        port_type: &PortType,
+    ) -> Result<crate::types::PortTypeConnection, crate::types::PortTypeConnectionError> {
         match self {
-            ParamSchema::Number { .. } => PortType::number().accepts(port_type),
-            ParamSchema::Text { .. } => PortType::text().accepts(port_type),
-            ParamSchema::Enum { .. } => PortType::text().accepts(port_type),
-            ParamSchema::Bool { .. } => {
-                PortType::bool().accepts(port_type) || PortType::number().accepts(port_type)
+            ParamSchema::Number { .. } => PortType::number().resolve_connection(port_type),
+            ParamSchema::Text { .. } | ParamSchema::Enum { .. } => {
+                PortType::text().resolve_connection(port_type)
             }
+            ParamSchema::Bool { .. } => PortType::bool()
+                .resolve_connection(port_type)
+                .or_else(|_| PortType::number().resolve_connection(port_type)),
             ParamSchema::Custom {
                 port_type: expected,
                 ..
-            } => expected.accepts(port_type),
+            } => expected.resolve_connection(port_type),
         }
     }
 
@@ -135,6 +144,56 @@ impl ParamSchema {
         }
     }
 
+    /// Infer the effective port type for a validated inline value.
+    pub fn infer_inline_port_type(&self, value: &Value) -> Option<PortType> {
+        if !self.validate_inline_value(value) {
+            return None;
+        }
+
+        Some(match self {
+            ParamSchema::Number { .. } => PortType::number(),
+            ParamSchema::Text { .. } | ParamSchema::Enum { .. } => PortType::text(),
+            ParamSchema::Bool { .. } => PortType::bool(),
+            ParamSchema::Custom {
+                port_type,
+                value_kind,
+                inline_mode,
+                ..
+            } => {
+                if matches!(inline_mode, ParamInlineMode::Ident) {
+                    return Some(port_type.clone());
+                }
+
+                match value_kind {
+                    ParamValueKind::Number => PortType::number(),
+                    ParamValueKind::Text => PortType::text(),
+                    ParamValueKind::Bool => PortType::bool(),
+                    ParamValueKind::Json => {
+                        infer_port_type_from_json(value).unwrap_or_else(|| port_type.clone())
+                    }
+                    ParamValueKind::None => port_type.clone(),
+                }
+            }
+        })
+    }
+
+    /// Infer the effective port type when the parameter resolves from either
+    /// an inline value or its schema default.
+    pub fn resolved_port_type(&self, inline_value: Option<&Value>) -> Option<PortType> {
+        if let Some(value) = inline_value {
+            return self.infer_inline_port_type(value);
+        }
+
+        match self {
+            ParamSchema::Number { .. } => Some(PortType::number()),
+            ParamSchema::Text { .. } | ParamSchema::Enum { .. } => Some(PortType::text()),
+            ParamSchema::Bool { .. } => Some(PortType::bool()),
+            ParamSchema::Custom { default, .. } => default
+                .as_ref()
+                .and_then(|value| self.infer_inline_port_type(value)),
+        }
+    }
+
     /// Validate a JSON inline value against this schema.
     pub fn validate_inline_value(&self, value: &Value) -> bool {
         match self {
@@ -142,7 +201,7 @@ impl ParamSchema {
             ParamSchema::Text { .. } => value.is_string(),
             ParamSchema::Enum { options, .. } => value
                 .as_str()
-                .map_or(false, |s| options.contains(&s.to_string())),
+                .is_some_and(|s| options.contains(&s.to_string())),
             ParamSchema::Bool { .. } => value.is_boolean(),
             ParamSchema::Custom {
                 value_kind,
@@ -183,15 +242,15 @@ fn validate_number(value: &Value, min: Option<f64>, max: Option<f64>) -> bool {
     let Some(number) = value.as_f64() else {
         return false;
     };
-    if let Some(min) = min {
-        if number < min {
-            return false;
-        }
+    if let Some(min) = min
+        && number < min
+    {
+        return false;
     }
-    if let Some(max) = max {
-        if number > max {
-            return false;
-        }
+    if let Some(max) = max
+        && number > max
+    {
+        return false;
     }
     true
 }
@@ -200,6 +259,15 @@ fn value_to_expr(value: &Value, inline_mode: &ParamInlineMode) -> Option<Expr> {
     match inline_mode {
         ParamInlineMode::Literal => Some(Expr::from_json_value(value)),
         ParamInlineMode::Ident => value.as_str().and_then(parse_ident_path),
+    }
+}
+
+fn infer_port_type_from_json(value: &Value) -> Option<PortType> {
+    match value {
+        Value::Number(_) => Some(PortType::number()),
+        Value::String(_) => Some(PortType::text()),
+        Value::Bool(_) => Some(PortType::bool()),
+        _ => None,
     }
 }
 
@@ -234,6 +302,8 @@ pub struct PieceDef {
     pub output_type: Option<PortType>,
     pub output_side: Option<TileSide>,
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 impl PieceDef {
@@ -286,6 +356,8 @@ impl<'de> Deserialize<'de> for PieceDef {
             output_type: Option<PortType>,
             output_side: Option<TileSide>,
             description: Option<String>,
+            #[serde(default)]
+            tags: Option<Vec<String>>,
         }
 
         let raw = PieceDefSerde::deserialize(deserializer)?;
@@ -304,11 +376,12 @@ impl<'de> Deserialize<'de> for PieceDef {
             output_type: raw.output_type,
             output_side: raw.output_side,
             description: raw.description,
+            tags: raw.tags.unwrap_or_default(),
         })
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 /// Inputs resolved for a node at compile time.
 pub struct PieceInputs {
     #[serde(default)]
@@ -329,13 +402,69 @@ impl PieceInputs {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Resolved port types available while compiling a node.
+///
+/// These types come from semantic inference, so pieces can safely dispatch on
+/// the effective types of their inputs instead of repeating brittle,
+/// piece-specific type resolution logic inside `compile`.
+pub struct ResolvedPieceTypes {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub input_types: BTreeMap<String, PortType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_type: Option<PortType>,
+}
+
+impl ResolvedPieceTypes {
+    /// Return the inferred type for a resolved input by id.
+    pub fn input_type(&self, key: &str) -> Option<&PortType> {
+        self.input_types.get(key)
+    }
+
+    /// Return this node's inferred output type, if known.
+    pub fn inferred_output_type(&self) -> Option<&PortType> {
+        self.output_type.as_ref()
+    }
+}
+
 /// Trait implemented by every placeable piece type.
 pub trait Piece: Send + Sync {
     /// Return the static piece definition used by UI, validation, and compilation.
     fn def(&self) -> &PieceDef;
 
     /// Compile this node using its resolved graph inputs and inline params.
+    ///
+    /// Most pieces can implement this untyped hook directly. Pieces that need
+    /// ad-hoc polymorphism based on inferred input/output types should instead
+    /// override [`Piece::compile_with_types`].
     fn compile(&self, inputs: &PieceInputs, inline_params: &BTreeMap<String, Value>) -> Expr;
+
+    /// Compile this node with access to resolved input and output port types.
+    ///
+    /// The compiler calls this hook so pieces can dispatch on semantic
+    /// inference results. The default implementation preserves existing
+    /// behavior by delegating to [`Piece::compile`].
+    fn compile_with_types(
+        &self,
+        inputs: &PieceInputs,
+        inline_params: &BTreeMap<String, Value>,
+        _resolved_types: &ResolvedPieceTypes,
+    ) -> Expr {
+        self.compile(inputs, inline_params)
+    }
+
+    /// Infer this node's effective output type from resolved input port types.
+    ///
+    /// The default implementation falls back to the static output type declared
+    /// on [`PieceDef`]. Generic pieces can override this to propagate or refine
+    /// types based on their inputs.
+    fn infer_output_type(
+        &self,
+        _input_types: &BTreeMap<String, PortType>,
+        _inline_params: &BTreeMap<String, Value>,
+    ) -> Option<PortType> {
+        self.def().output_type.clone()
+    }
 
     /// Return per-side output expressions for multi-output pieces (e.g. cross connectors).
     /// When `Some`, the compiler resolves edges by matching the exit direction to the
@@ -346,6 +475,16 @@ pub trait Piece: Send + Sync {
         _inline_params: &BTreeMap<String, Value>,
     ) -> Option<BTreeMap<TileSide, Expr>> {
         None
+    }
+
+    /// Typed variant of [`Piece::compile_multi_output`].
+    fn compile_multi_output_with_types(
+        &self,
+        inputs: &PieceInputs,
+        inline_params: &BTreeMap<String, Value>,
+        _resolved_types: &ResolvedPieceTypes,
+    ) -> Option<BTreeMap<TileSide, Expr>> {
+        self.compile_multi_output(inputs, inline_params)
     }
 
     /// Return the initial persisted state for a stateful piece, if any.
@@ -362,6 +501,39 @@ pub trait Piece: Send + Sync {
     ) -> (Expr, Value) {
         (self.compile(inputs, inline_params), state.clone())
     }
+
+    /// Typed variant of [`Piece::compile_stateful`].
+    ///
+    /// Stateful pieces that also dispatch on inferred types should override
+    /// this hook so they can use both the current state and semantic type
+    /// information in one place.
+    fn compile_stateful_with_types(
+        &self,
+        inputs: &PieceInputs,
+        inline_params: &BTreeMap<String, Value>,
+        state: &Value,
+        _resolved_types: &ResolvedPieceTypes,
+    ) -> (Expr, Value) {
+        self.compile_stateful(inputs, inline_params, state)
+    }
+
+    /// Return a static preview timeline for this piece, if it knows its
+    /// temporal structure at compile time.
+    ///
+    /// This allows the UI to animate nodes in preview mode without a running
+    /// runtime. All step positions are normalised over one abstract preview
+    /// window `[0.0, 1.0)`.
+    ///
+    /// Takes `inline_params` only (not [`PieceInputs`]) so preview works for
+    /// disconnected nodes without full compilation.
+    ///
+    /// Default: `None` (no preview animation).
+    fn preview_timeline(
+        &self,
+        _inline_params: &BTreeMap<String, Value>,
+    ) -> Option<PreviewTimeline> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -370,7 +542,7 @@ mod tests {
         ParamDef, ParamInlineMode, ParamSchema, ParamTextSemantics, ParamValueKind, PieceDef,
     };
     use crate::ast::Expr;
-    use crate::types::{PieceCategory, PieceSemanticKind, TileSide};
+    use crate::types::{PieceCategory, PieceSemanticKind, PortType, TileSide};
     use serde_json::json;
 
     #[test]
@@ -518,6 +690,7 @@ mod tests {
             output_type: Some("bool".into()),
             output_side: Some(TileSide::RIGHT),
             description: None,
+            tags: vec![],
         };
         let intrinsic_piece = PieceDef {
             id: "strudel.fast".into(),
@@ -529,6 +702,7 @@ mod tests {
             output_type: Some("pattern".into()),
             output_side: Some(TileSide::RIGHT),
             description: None,
+            tags: vec![],
         };
         let trick_piece = PieceDef {
             id: "user.twist".into(),
@@ -540,11 +714,48 @@ mod tests {
             output_type: Some("any".into()),
             output_side: Some(TileSide::RIGHT),
             description: None,
+            tags: vec![],
         };
 
         assert!(core_piece.is_visible_in_namespace("lua"));
         assert!(intrinsic_piece.is_visible_in_namespace("strudel"));
         assert!(!intrinsic_piece.is_visible_in_namespace("lua"));
         assert!(trick_piece.is_visible_in_namespace("lua"));
+    }
+
+    #[test]
+    fn custom_any_schema_infers_number_from_inline_value() {
+        let schema = ParamSchema::Custom {
+            port_type: PortType::any(),
+            value_kind: ParamValueKind::Json,
+            default: None,
+            can_inline: true,
+            inline_mode: ParamInlineMode::Literal,
+            min: None,
+            max: None,
+        };
+
+        assert_eq!(
+            schema.infer_inline_port_type(&json!(42)),
+            Some(PortType::number())
+        );
+    }
+
+    #[test]
+    fn ident_inline_mode_keeps_declared_port_type_for_inference() {
+        let schema = ParamSchema::Custom {
+            port_type: PortType::new("pattern"),
+            value_kind: ParamValueKind::Text,
+            default: None,
+            can_inline: true,
+            inline_mode: ParamInlineMode::Ident,
+            min: None,
+            max: None,
+        };
+
+        assert_eq!(
+            schema.infer_inline_port_type(&json!("foo.bar")),
+            Some(PortType::new("pattern"))
+        );
     }
 }

@@ -1,7 +1,9 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::types::{EdgeId, GridPos, PortType, TileSide};
+use crate::types::{DomainBridge, EdgeId, GridPos, PortType, TileSide};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -45,6 +47,15 @@ pub enum DiagnosticKind {
         expected: PortType,
         got: PortType,
         param: String,
+    },
+    UnsupportedDomainCrossing {
+        expected: PortType,
+        got: PortType,
+        param: String,
+    },
+    DelayTypeMismatch {
+        default: PortType,
+        feedback: PortType,
     },
     SideMismatch {
         from_pos: GridPos,
@@ -110,6 +121,17 @@ pub struct SemanticResult {
     pub eval_order: Vec<GridPos>,
     /// All terminal nodes found.
     pub terminals: Vec<GridPos>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub output_types: BTreeMap<GridPos, PortType>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub domain_bridges: BTreeMap<EdgeId, DomainBridge>,
+    /// Edges classified as delay (feedback) edges.
+    ///
+    /// These edges target a `core.delay` node's `"value"` param and are
+    /// excluded from the topological sort so that cycles through delay
+    /// nodes are legal.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub delay_edges: BTreeSet<EdgeId>,
 }
 
 impl SemanticResult {

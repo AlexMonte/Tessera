@@ -7,6 +7,12 @@ pub struct PieceRegistry {
     pieces: BTreeMap<String, Arc<dyn Piece>>,
 }
 
+impl Default for PieceRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PieceRegistry {
     pub fn new() -> Self {
         Self {
@@ -41,6 +47,31 @@ impl PieceRegistry {
             .filter_map(|piece| {
                 let def = piece.def();
                 def.is_visible_in_namespace(namespace).then(|| def.clone())
+            })
+            .collect()
+    }
+
+    pub fn search_by_tag(&self, tag: &str) -> Vec<PieceDef> {
+        self.pieces
+            .values()
+            .filter_map(|piece| {
+                let def = piece.def();
+                def.tags
+                    .iter()
+                    .any(|candidate| candidate == tag)
+                    .then(|| def.clone())
+            })
+            .collect()
+    }
+
+    pub fn search_by_tag_in_namespace(&self, tag: &str, namespace: &str) -> Vec<PieceDef> {
+        self.pieces
+            .values()
+            .filter_map(|piece| {
+                let def = piece.def();
+                (def.is_visible_in_namespace(namespace)
+                    && def.tags.iter().any(|candidate| candidate == tag))
+                .then(|| def.clone())
             })
             .collect()
     }
@@ -85,6 +116,7 @@ mod tests {
                 output_type: Some("bool".into()),
                 output_side: Some(TileSide::RIGHT),
                 description: None,
+                tags: vec!["logic".into(), "boolean".into()],
             },
         });
         registry.register(TestPiece {
@@ -98,6 +130,7 @@ mod tests {
                 output_type: Some("pattern".into()),
                 output_side: Some(TileSide::RIGHT),
                 description: None,
+                tags: vec!["math".into()],
             },
         });
         registry.register(TestPiece {
@@ -111,6 +144,7 @@ mod tests {
                 output_type: Some("any".into()),
                 output_side: Some(TileSide::RIGHT),
                 description: None,
+                tags: vec!["math".into(), "favorite".into()],
             },
         });
 
@@ -127,5 +161,106 @@ mod tests {
             .map(|def| def.id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["core.not", "user.twist"]);
+    }
+
+    #[test]
+    fn search_by_tag_returns_matching_defs() {
+        let mut registry = PieceRegistry::new();
+        registry.register(TestPiece {
+            def: PieceDef {
+                id: "core.not".into(),
+                label: "not".into(),
+                category: PieceCategory::Transform,
+                semantic_kind: PieceSemanticKind::Operator,
+                namespace: "core".into(),
+                params: vec![],
+                output_type: Some("bool".into()),
+                output_side: Some(TileSide::RIGHT),
+                description: None,
+                tags: vec!["logic".into(), "boolean".into()],
+            },
+        });
+        registry.register(TestPiece {
+            def: PieceDef {
+                id: "strudel.fast".into(),
+                label: "fast".into(),
+                category: PieceCategory::Transform,
+                semantic_kind: PieceSemanticKind::Intrinsic,
+                namespace: "strudel".into(),
+                params: vec![],
+                output_type: Some("pattern".into()),
+                output_side: Some(TileSide::RIGHT),
+                description: None,
+                tags: vec!["timing".into()],
+            },
+        });
+
+        let ids = registry
+            .search_by_tag("logic")
+            .into_iter()
+            .map(|def| def.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["core.not"]);
+    }
+
+    #[test]
+    fn search_by_tag_in_namespace_uses_visibility_rules() {
+        let mut registry = PieceRegistry::new();
+        registry.register(TestPiece {
+            def: PieceDef {
+                id: "core.not".into(),
+                label: "not".into(),
+                category: PieceCategory::Transform,
+                semantic_kind: PieceSemanticKind::Operator,
+                namespace: "core".into(),
+                params: vec![],
+                output_type: Some("bool".into()),
+                output_side: Some(TileSide::RIGHT),
+                description: None,
+                tags: vec!["logic".into()],
+            },
+        });
+        registry.register(TestPiece {
+            def: PieceDef {
+                id: "strudel.fast".into(),
+                label: "fast".into(),
+                category: PieceCategory::Transform,
+                semantic_kind: PieceSemanticKind::Intrinsic,
+                namespace: "strudel".into(),
+                params: vec![],
+                output_type: Some("pattern".into()),
+                output_side: Some(TileSide::RIGHT),
+                description: None,
+                tags: vec!["logic".into()],
+            },
+        });
+        registry.register(TestPiece {
+            def: PieceDef {
+                id: "user.twist".into(),
+                label: "twist".into(),
+                category: PieceCategory::Trick,
+                semantic_kind: PieceSemanticKind::Trick,
+                namespace: "user".into(),
+                params: vec![],
+                output_type: Some("any".into()),
+                output_side: Some(TileSide::RIGHT),
+                description: None,
+                tags: vec!["logic".into()],
+            },
+        });
+
+        let strudel_ids = registry
+            .search_by_tag_in_namespace("logic", "strudel")
+            .into_iter()
+            .map(|def| def.id)
+            .collect::<Vec<_>>();
+        assert_eq!(strudel_ids, vec!["core.not", "strudel.fast", "user.twist"]);
+
+        let lua_ids = registry
+            .search_by_tag_in_namespace("logic", "lua")
+            .into_iter()
+            .map(|def| def.id)
+            .collect::<Vec<_>>();
+        assert_eq!(lua_ids, vec!["core.not", "user.twist"]);
     }
 }

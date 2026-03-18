@@ -14,6 +14,7 @@
 //! adaptation pass before backend rendering.
 
 use crate::ast::{BinOp, Expr, ExprKind, Lit, StringSyntax, UnaryOp};
+use crate::types::DomainBridgeKind;
 
 // ---------------------------------------------------------------------------
 // Precedence levels (higher = tighter binding)
@@ -90,6 +91,37 @@ pub trait Backend {
         format!("{{{inner}}}")
     }
 
+    /// Render a block of let-bindings followed by a result expression.
+    ///
+    /// `bindings` is a list of `(name, rendered_value)` pairs.
+    /// `result` is the already-rendered result expression.
+    fn render_block(&self, bindings: &[(String, String)], result: &str) -> String {
+        let mut parts = Vec::with_capacity(bindings.len() + 1);
+        for (name, value) in bindings {
+            parts.push(format!("let {name} = {value}"));
+        }
+        parts.push(format!("return {result}"));
+        let body = parts.join("; ");
+        format!("(() => {{ {body}; }})()")
+    }
+
+    /// Render a delay buffer reference.
+    ///
+    /// `slot` is the unique buffer identifier; `default` is the already-rendered
+    /// initial value for frame 0. The host runtime must provide a `__delay`
+    /// function (or equivalent) that reads from the named frame buffer.
+    fn render_delay_ref(&self, slot: &str, default: &str) -> String {
+        format!("__delay('{slot}', {default})")
+    }
+
+    /// Render an implicit execution-domain conversion.
+    ///
+    /// The default form expects the host runtime to provide a
+    /// `__domain_convert(kind, value)` helper that performs the conversion.
+    fn render_domain_convert(&self, kind: DomainBridgeKind, expr: &str) -> String {
+        format!("__domain_convert('{}', {expr})", kind.as_str())
+    }
+
     /// Render an error placeholder.
     fn render_error(&self, message: &str) -> String {
         format!("/* {message} */")
@@ -152,6 +184,9 @@ pub trait Backend {
             | ExprKind::Ident { .. }
             | ExprKind::Array { .. }
             | ExprKind::Record { .. }
+            | ExprKind::Block { .. }
+            | ExprKind::DelayRef { .. }
+            | ExprKind::DomainConvert { .. }
             | ExprKind::Error { .. } => PREC_ATOM,
         }
     }
@@ -229,6 +264,22 @@ pub trait Backend {
                     .map(|(k, v)| (k.clone(), self.render(v)))
                     .collect();
                 self.render_record_literal(&rendered)
+            }
+            ExprKind::Block { bindings, result } => {
+                let rendered_bindings: Vec<(String, String)> = bindings
+                    .iter()
+                    .map(|(name, value)| (name.clone(), self.render(value)))
+                    .collect();
+                let result_str = self.render(result);
+                self.render_block(&rendered_bindings, &result_str)
+            }
+            ExprKind::DelayRef { slot, default } => {
+                let default_str = self.render(default);
+                self.render_delay_ref(slot, &default_str)
+            }
+            ExprKind::DomainConvert { kind, input } => {
+                let rendered = self.render(input);
+                self.render_domain_convert(*kind, &rendered)
             }
             ExprKind::Error { message } => self.render_error(message),
         }
@@ -417,6 +468,20 @@ impl Backend for LuaBackend {
         format!("{{{inner}}}")
     }
 
+    fn render_block(&self, bindings: &[(String, String)], result: &str) -> String {
+        let mut parts = Vec::with_capacity(bindings.len() + 1);
+        for (name, value) in bindings {
+            parts.push(format!("local {name} = {value}"));
+        }
+        parts.push(format!("return {result}"));
+        let body = parts.join("; ");
+        format!("(function() {body} end)()")
+    }
+
+    fn render_delay_ref(&self, slot: &str, default: &str) -> String {
+        format!("__delay('{slot}', {default})")
+    }
+
     fn render_error(&self, message: &str) -> String {
         format!("--[[ {message} ]]")
     }
@@ -443,6 +508,7 @@ impl Backend for LuaBackend {
 mod tests {
     use super::*;
     use crate::ast::Expr;
+    use crate::types::DomainBridgeKind;
 
     fn js() -> &'static dyn Backend {
         &JsBackend
@@ -545,6 +611,12 @@ mod tests {
     fn js_record() {
         let expr = Expr::record(vec![("x".into(), Expr::int(1))]);
         assert_eq!(js().render(&expr), "{x: 1}");
+    }
+
+    #[test]
+    fn js_block() {
+        let expr = Expr::block(vec![("_t0".into(), Expr::int(3))], Expr::ident("_t0"));
+        assert_eq!(js().render(&expr), "(() => { let _t0 = 3; return _t0; })()");
     }
 
     #[test]
@@ -682,6 +754,15 @@ mod tests {
     }
 
     #[test]
+    fn lua_block() {
+        let expr = Expr::block(vec![("_t0".into(), Expr::int(3))], Expr::ident("_t0"));
+        assert_eq!(
+            lua().render(&expr),
+            "(function() local _t0 = 3; return _t0 end)()"
+        );
+    }
+
+    #[test]
     fn lua_ne() {
         let expr = Expr::bin_op(BinOp::Ne, Expr::ident("a"), Expr::ident("b"));
         assert_eq!(lua().render(&expr), "a ~= b");
@@ -727,5 +808,43 @@ mod tests {
             Expr::str_lit("c"),
         );
         assert_eq!(lua().render(&expr), "('a' .. 'b') .. 'c'");
+    }
+
+    // -- DelayRef rendering tests --
+
+    #[test]
+    fn js_delay_ref() {
+        let expr = Expr::delay_ref("d_3_2", Expr::int(0));
+        assert_eq!(js().render(&expr), "__delay('d_3_2', 0)");
+    }
+
+    #[test]
+    fn js_delay_ref_with_complex_default() {
+        let expr = Expr::delay_ref("d_0_0", Expr::str_lit("silence"));
+        assert_eq!(js().render(&expr), "__delay('d_0_0', 'silence')");
+    }
+
+    #[test]
+    fn js_domain_convert_uses_runtime_helper() {
+        let expr = Expr::domain_convert(DomainBridgeKind::ControlToAudio, Expr::ident("signal"));
+        assert_eq!(
+            js().render(&expr),
+            "__domain_convert('control_to_audio', signal)"
+        );
+    }
+
+    #[test]
+    fn lua_delay_ref() {
+        let expr = Expr::delay_ref("d_3_2", Expr::int(0));
+        assert_eq!(lua().render(&expr), "__delay('d_3_2', 0)");
+    }
+
+    #[test]
+    fn lua_domain_convert_uses_runtime_helper() {
+        let expr = Expr::domain_convert(DomainBridgeKind::AudioToControl, Expr::ident("signal"));
+        assert_eq!(
+            lua().render(&expr),
+            "__domain_convert('audio_to_control', signal)"
+        );
     }
 }

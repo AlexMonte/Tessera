@@ -1,12 +1,19 @@
 //! Graph mutation, wiring validation, and auto-repair helpers.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::{Deserialize, Serialize};
 
+use crate::compiler::CompileCache;
 use crate::diagnostics::{Diagnostic, DiagnosticKind};
 use crate::graph::{Edge, Graph, GraphOp, Node};
 use crate::piece::PieceDef;
 use crate::piece_registry::PieceRegistry;
-use crate::types::{EdgeId, GridPos, PortType, TileSide, adjacent_in_direction};
+use crate::semantic::semantic_pass;
+use crate::types::{
+    DomainBridgeKind, EdgeId, GridPos, PortType, PortTypeConnectionError, TileSide,
+    adjacent_in_direction,
+};
 
 /// A machine-readable repair suggestion that a UI can present as a one-click fix.
 ///
@@ -33,12 +40,12 @@ impl RepairSuggestion {
     pub fn to_ops(&self) -> Vec<GraphOp> {
         match self {
             RepairSuggestion::MoveNode { node, to } => vec![GraphOp::NodeMove {
-                from: node.clone(),
-                to: to.clone(),
+                from: *node,
+                to: *to,
             }],
             RepairSuggestion::SetOutputSide { position, side } => {
                 vec![GraphOp::OutputSetSide {
-                    position: position.clone(),
+                    position: *position,
                     side: *side,
                 }]
             }
@@ -47,7 +54,7 @@ impl RepairSuggestion {
                 param_id,
                 side,
             } => vec![GraphOp::ParamSetSide {
-                position: position.clone(),
+                position: *position,
                 param_id: param_id.clone(),
                 side: *side,
             }],
@@ -83,7 +90,7 @@ fn ensure_in_bounds(
         return true;
     }
     errors.push(invalid_op(
-        Some(pos.clone()),
+        Some(*pos),
         format!(
             "{} out of bounds at ({}, {}), allowed cols=[0..{}), rows=[0..{})",
             label, pos.col, pos.row, graph.cols, graph.rows
@@ -118,6 +125,7 @@ pub enum EdgeConnectProbeReason {
     NoParamOnTargetSide,
     TargetParamOccupied,
     TypeMismatch,
+    UnsupportedDomain,
     NoCompatibleParam,
 }
 
@@ -125,6 +133,8 @@ pub enum EdgeConnectProbeReason {
 /// Result of probing an edge connection, with optional repair suggestions.
 pub struct EdgeTargetParamProbe {
     pub to_param: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implicit_bridge: Option<DomainBridgeKind>,
     pub reason: Option<EdgeConnectProbeReason>,
     pub detail: Option<String>,
     /// Machine-readable repair suggestions. Each entry maps to graph ops via `to_ops()`.
@@ -134,8 +144,13 @@ pub struct EdgeTargetParamProbe {
 
 impl EdgeTargetParamProbe {
     fn accept(param: String) -> Self {
+        Self::accept_with_bridge(param, None)
+    }
+
+    fn accept_with_bridge(param: String, implicit_bridge: Option<DomainBridgeKind>) -> Self {
         Self {
             to_param: Some(param),
+            implicit_bridge,
             reason: None,
             detail: None,
             suggestions: Vec::new(),
@@ -145,6 +160,7 @@ impl EdgeTargetParamProbe {
     fn reject(reason: EdgeConnectProbeReason, detail: impl Into<String>) -> Self {
         Self {
             to_param: None,
+            implicit_bridge: None,
             reason: Some(reason),
             detail: Some(detail.into()),
             suggestions: Vec::new(),
@@ -158,6 +174,7 @@ impl EdgeTargetParamProbe {
     ) -> Self {
         Self {
             to_param: None,
+            implicit_bridge: None,
             reason: Some(reason),
             detail: Some(detail.into()),
             suggestions,
@@ -212,6 +229,7 @@ fn resolve_edge_connect_base<'a>(
 
 fn source_output_type_for_target_side(
     base: &EdgeConnectBase<'_>,
+    inferred_output_types: &BTreeMap<GridPos, PortType>,
     from: &GridPos,
     target_side: TileSide,
 ) -> Result<PortType, EdgeTargetParamProbe> {
@@ -225,12 +243,12 @@ fn source_output_type_for_target_side(
                 output_side, target_side
             ),
             vec![RepairSuggestion::SetOutputSide {
-                position: from.clone(),
+                position: *from,
                 side: target_side.opposite(),
             }],
         ));
     }
-    let Some(output_type) = base.from_piece_def.output_type.as_ref() else {
+    let Some(output_type) = inferred_output_types.get(from) else {
         return Err(EdgeTargetParamProbe::reject(
             EdgeConnectProbeReason::OutputFromTerminal,
             "cannot connect output from terminal piece",
@@ -266,6 +284,7 @@ pub fn pick_target_param_for_edge(
         Ok(base) => base,
         Err(err) => return err,
     };
+    let inferred_output_types = semantic_pass(graph, registry).output_types;
 
     let Some(target_side) = side_from_to_node(to_node, from) else {
         // Suggest moving source to the first open adjacent position with a compatible param.
@@ -275,7 +294,7 @@ pub fn pick_target_param_for_edge(
                 let adj = adjacent_in_direction(to_node, Some(param_side));
                 if adj != *to_node && !graph.nodes.contains_key(&adj) {
                     suggestions.push(RepairSuggestion::MoveNode {
-                        node: from.clone(),
+                        node: *from,
                         to: adj,
                     });
                     break;
@@ -294,13 +313,20 @@ pub fn pick_target_param_for_edge(
         );
     };
 
-    let source_output_type = match source_output_type_for_target_side(&base, from, target_side) {
+    let source_output_type = match source_output_type_for_target_side(
+        &base,
+        &inferred_output_types,
+        from,
+        target_side,
+    ) {
         Ok(output_type) => output_type,
         Err(err) => return err,
     };
 
     let mut saw_side_candidate = false;
     let mut saw_open_side_candidate = false;
+    let mut bridgeable_candidate = None::<(String, DomainBridgeKind)>;
+    let mut unsupported_domain_detail = None::<String>;
     for param in &base.to_piece_def.params {
         let Some(param_side) = node_param_side(base.to_node_ref, param.id.as_str()) else {
             continue;
@@ -317,8 +343,24 @@ pub fn pick_target_param_for_edge(
             continue;
         }
         saw_open_side_candidate = true;
-        if param.schema.accepts(&source_output_type) {
-            return EdgeTargetParamProbe::accept(param.id.clone());
+        match param.schema.resolve_connection(&source_output_type) {
+            Ok(connection) => {
+                if let Some(bridge_kind) = connection.bridge_kind {
+                    bridgeable_candidate
+                        .get_or_insert_with(|| (param.id.clone(), bridge_kind));
+                } else {
+                    return EdgeTargetParamProbe::accept(param.id.clone());
+                }
+            }
+            Err(PortTypeConnectionError::UnsupportedDomain { expected, got }) => {
+                unsupported_domain_detail.get_or_insert_with(|| {
+                    format!(
+                        "unsupported domain crossing: expected {:?}, got {:?}",
+                        expected, got
+                    )
+                });
+            }
+            Err(PortTypeConnectionError::ValueMismatch { .. }) => {}
         }
     }
 
@@ -331,7 +373,7 @@ pub fn pick_target_param_for_edge(
             .filter(|p| p.schema.accepts(&source_output_type))
             .take(1)
             .map(|p| RepairSuggestion::SetParamSide {
-                position: to_node.clone(),
+                position: *to_node,
                 param_id: p.id.clone(),
                 side: target_side,
             })
@@ -371,6 +413,12 @@ pub fn pick_target_param_for_edge(
             suggestions,
         );
     }
+    if let Some((param_id, bridge_kind)) = bridgeable_candidate {
+        return EdgeTargetParamProbe::accept_with_bridge(param_id, Some(bridge_kind));
+    }
+    if let Some(detail) = unsupported_domain_detail {
+        return EdgeTargetParamProbe::reject(EdgeConnectProbeReason::UnsupportedDomain, detail);
+    }
     EdgeTargetParamProbe::reject(
         EdgeConnectProbeReason::TypeMismatch,
         "type mismatch: no open target param on the connecting side accepts the source output type",
@@ -384,8 +432,9 @@ pub fn validate_edge_connect(
     from: &GridPos,
     to_node: &GridPos,
     to_param: &str,
-) -> Result<(), EdgeTargetParamProbe> {
+) -> Result<Option<DomainBridgeKind>, EdgeTargetParamProbe> {
     let base = resolve_edge_connect_base(graph, registry, from, to_node)?;
+    let inferred_output_types = semantic_pass(graph, registry).output_types;
 
     let Some(param_def) = base
         .to_piece_def
@@ -403,7 +452,7 @@ pub fn validate_edge_connect(
         let suggestions = side_from_to_node(to_node, from)
             .into_iter()
             .map(|side| RepairSuggestion::SetParamSide {
-                position: to_node.clone(),
+                position: *to_node,
                 param_id: to_param.to_string(),
                 side,
             })
@@ -423,13 +472,14 @@ pub fn validate_edge_connect(
                 target_side, expected.col, expected.row
             ),
             vec![RepairSuggestion::MoveNode {
-                node: from.clone(),
+                node: *from,
                 to: expected,
             }],
         ));
     }
 
-    let source_output_type = source_output_type_for_target_side(&base, from, target_side)?;
+    let source_output_type =
+        source_output_type_for_target_side(&base, &inferred_output_types, from, target_side)?;
     if let Some(existing) = graph
         .edges
         .values()
@@ -443,17 +493,24 @@ pub fn validate_edge_connect(
             }],
         ));
     }
-    if !param_def.schema.accepts(&source_output_type) {
-        return Err(EdgeTargetParamProbe::reject(
-            EdgeConnectProbeReason::TypeMismatch,
-            format!(
-                "type mismatch: expected {:?}, got {:?}",
-                param_def.schema.expected_port_type(),
-                source_output_type
+    match param_def.schema.resolve_connection(&source_output_type) {
+        Ok(connection) => Ok(connection.bridge_kind),
+        Err(PortTypeConnectionError::ValueMismatch { expected, got }) => Err(
+            EdgeTargetParamProbe::reject(
+                EdgeConnectProbeReason::TypeMismatch,
+                format!("type mismatch: expected {:?}, got {:?}", expected, got),
             ),
-        ));
+        ),
+        Err(PortTypeConnectionError::UnsupportedDomain { expected, got }) => Err(
+            EdgeTargetParamProbe::reject(
+                EdgeConnectProbeReason::UnsupportedDomain,
+                format!(
+                    "unsupported domain crossing: expected {:?}, got {:?}",
+                    expected, got
+                ),
+            ),
+        ),
     }
-    Ok(())
 }
 
 /// Probe an edge using either an explicit param or automatic target-param selection.
@@ -466,7 +523,9 @@ pub fn probe_edge_connect(
 ) -> EdgeTargetParamProbe {
     if let Some(to_param) = to_param {
         return match validate_edge_connect(graph, registry, from, to_node, to_param) {
-            Ok(()) => EdgeTargetParamProbe::accept(to_param.to_string()),
+            Ok(bridge_kind) => {
+                EdgeTargetParamProbe::accept_with_bridge(to_param.to_string(), bridge_kind)
+            }
             Err(reject) => reject,
         };
     }
@@ -511,6 +570,7 @@ fn edge_is_still_valid(edge: &Edge, graph: &Graph, registry: &PieceRegistry) -> 
     let Ok(base) = resolve_edge_connect_base(graph, registry, &edge.from, &edge.to_node) else {
         return false;
     };
+    let inferred_output_types = semantic_pass(graph, registry).output_types;
     let Some(param_def) = base
         .to_piece_def
         .params
@@ -524,9 +584,12 @@ fn edge_is_still_valid(edge: &Edge, graph: &Graph, registry: &PieceRegistry) -> 
         if expected != edge.from {
             return false;
         }
-        let Ok(source_output_type) =
-            source_output_type_for_target_side(&base, &edge.from, target_side)
-        else {
+        let Ok(source_output_type) = source_output_type_for_target_side(
+            &base,
+            &inferred_output_types,
+            &edge.from,
+            target_side,
+        ) else {
             return false;
         };
         param_def.schema.accepts(&source_output_type)
@@ -615,7 +678,7 @@ fn auto_wire_node(
                 let edge = Edge {
                     id: EdgeId::new(),
                     from: source_pos,
-                    to_node: position.clone(),
+                    to_node: *position,
                     to_param: param.id.clone(),
                 };
                 graph.edges.insert(edge.id.clone(), edge.clone());
@@ -633,7 +696,7 @@ fn auto_wire_node(
             if let Some(to_param) = probe.to_param {
                 let edge = Edge {
                     id: EdgeId::new(),
-                    from: position.clone(),
+                    from: *position,
                     to_node: target_pos,
                     to_param,
                 };
@@ -658,8 +721,8 @@ fn auto_wire_node(
     for edge in &added_edges {
         outcome.applied_ops.push(GraphOp::EdgeConnect {
             edge_id: Some(edge.id.clone()),
-            from: edge.from.clone(),
-            to_node: edge.to_node.clone(),
+            from: edge.from,
+            to_node: edge.to_node,
             to_param: edge.to_param.clone(),
         });
         inverse.insert(
@@ -675,17 +738,17 @@ fn auto_wire_node(
 fn edge_connect_from(edge: &Edge) -> GraphOp {
     GraphOp::EdgeConnect {
         edge_id: Some(edge.id.clone()),
-        from: edge.from.clone(),
-        to_node: edge.to_node.clone(),
+        from: edge.from,
+        to_node: edge.to_node,
         to_param: edge.to_param.clone(),
     }
 }
 
 fn swap_rewrite_pos(pos: &mut GridPos, a: &GridPos, b: &GridPos) {
     if *pos == *a {
-        *pos = b.clone();
+        *pos = *b;
     } else if *pos == *b {
-        *pos = a.clone();
+        *pos = *a;
     }
 }
 
@@ -711,7 +774,7 @@ pub fn apply_ops_to_graph(
                 }
                 if graph.nodes.contains_key(position) {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!(
                             "node already exists at ({}, {})",
                             position.col, position.row
@@ -721,7 +784,7 @@ pub fn apply_ops_to_graph(
                 }
                 let Some(piece) = registry.get(piece_id.as_str()) else {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("unknown piece id '{}'", piece_id),
                     ));
                     continue;
@@ -735,7 +798,7 @@ pub fn apply_ops_to_graph(
                         .find(|param| param.id == *param_id)
                     else {
                         errors.push(invalid_op(
-                            Some(position.clone()),
+                            Some(*position),
                             format!("unknown inline param '{}'", param_id),
                         ));
                         inline_is_valid = false;
@@ -743,7 +806,7 @@ pub fn apply_ops_to_graph(
                     };
                     if !param_def.schema.can_inline() {
                         errors.push(invalid_op(
-                            Some(position.clone()),
+                            Some(*position),
                             format!("inline value is not allowed for '{}'", param_id),
                         ));
                         inline_is_valid = false;
@@ -751,7 +814,7 @@ pub fn apply_ops_to_graph(
                     }
                     if !param_def.schema.validate_inline_value(value) {
                         errors.push(invalid_op(
-                            Some(position.clone()),
+                            Some(*position),
                             format!("inline value has wrong type for '{}'", param_id),
                         ));
                         inline_is_valid = false;
@@ -761,7 +824,7 @@ pub fn apply_ops_to_graph(
                     continue;
                 }
                 graph.nodes.insert(
-                    position.clone(),
+                    *position,
                     Node {
                         piece_id: piece_id.clone(),
                         inline_params: inline_params.clone(),
@@ -772,13 +835,250 @@ pub fn apply_ops_to_graph(
                     },
                 );
                 outcome.applied_ops.push(GraphOp::NodePlace {
-                    position: position.clone(),
+                    position: *position,
                     piece_id: piece_id.clone(),
                     inline_params: inline_params.clone(),
                 });
                 inverse_chunks.push(vec![GraphOp::NodeRemove {
-                    position: position.clone(),
+                    position: *position,
                 }]);
+            }
+            GraphOp::NodeBatchPlace {
+                nodes,
+                edges,
+                auto_wire,
+            } => {
+                let mut batch_errors = Vec::<Diagnostic>::new();
+                let mut seen_positions = BTreeSet::<GridPos>::new();
+                let mut shadow_graph = graph.clone();
+
+                for entry in nodes {
+                    if !ensure_in_bounds(
+                        &mut batch_errors,
+                        &entry.position,
+                        "node_batch_place",
+                        graph,
+                    ) {
+                        continue;
+                    }
+                    if !seen_positions.insert(entry.position) {
+                        batch_errors.push(invalid_op(
+                            Some(entry.position),
+                            format!(
+                                "duplicate batch position at ({}, {})",
+                                entry.position.col, entry.position.row
+                            ),
+                        ));
+                        continue;
+                    }
+                    if graph.nodes.contains_key(&entry.position) {
+                        batch_errors.push(invalid_op(
+                            Some(entry.position),
+                            format!(
+                                "target cell already occupied at ({}, {})",
+                                entry.position.col, entry.position.row
+                            ),
+                        ));
+                        continue;
+                    }
+                    let Some(piece) = registry.get(entry.piece_id.as_str()) else {
+                        batch_errors.push(invalid_op(
+                            Some(entry.position),
+                            format!("unknown piece id '{}'", entry.piece_id),
+                        ));
+                        continue;
+                    };
+
+                    let mut entry_is_valid = true;
+                    for (param_id, value) in &entry.inline_params {
+                        let Some(param_def) = piece
+                            .def()
+                            .params
+                            .iter()
+                            .find(|param| param.id == *param_id)
+                        else {
+                            batch_errors.push(invalid_op(
+                                Some(entry.position),
+                                format!("unknown inline param '{}'", param_id),
+                            ));
+                            entry_is_valid = false;
+                            continue;
+                        };
+                        if !param_def.schema.can_inline() {
+                            batch_errors.push(invalid_op(
+                                Some(entry.position),
+                                format!("inline value is not allowed for '{}'", param_id),
+                            ));
+                            entry_is_valid = false;
+                            continue;
+                        }
+                        if !param_def.schema.validate_inline_value(value) {
+                            batch_errors.push(invalid_op(
+                                Some(entry.position),
+                                format!("inline value has wrong type for '{}'", param_id),
+                            ));
+                            entry_is_valid = false;
+                        }
+                    }
+
+                    for param_id in entry.input_sides.keys() {
+                        if piece.def().params.iter().any(|param| param.id == *param_id) {
+                            continue;
+                        }
+                        batch_errors.push(invalid_op(
+                            Some(entry.position),
+                            format!("unknown param '{}'", param_id),
+                        ));
+                        entry_is_valid = false;
+                    }
+
+                    if entry.output_side.is_some() && piece.def().output_type.is_none() {
+                        batch_errors.push(invalid_op(
+                            Some(entry.position),
+                            "cannot set output side on terminal piece",
+                        ));
+                        entry_is_valid = false;
+                    }
+
+                    if !entry_is_valid {
+                        continue;
+                    }
+
+                    shadow_graph.nodes.insert(
+                        entry.position,
+                        Node {
+                            piece_id: entry.piece_id.clone(),
+                            inline_params: entry.inline_params.clone(),
+                            input_sides: entry.input_sides.clone(),
+                            output_side: entry.output_side,
+                            label: entry.label.clone(),
+                            node_state: None,
+                        },
+                    );
+                }
+
+                if !batch_errors.is_empty() {
+                    errors.extend(batch_errors);
+                    continue;
+                }
+
+                let mut staged_edges = Vec::<Edge>::new();
+                for edge in edges {
+                    let source_ok = ensure_in_bounds(
+                        &mut batch_errors,
+                        &edge.from,
+                        "node_batch_place edge source",
+                        &shadow_graph,
+                    );
+                    let target_ok = ensure_in_bounds(
+                        &mut batch_errors,
+                        &edge.to_node,
+                        "node_batch_place edge target",
+                        &shadow_graph,
+                    );
+                    if !(source_ok && target_ok) {
+                        continue;
+                    }
+                    if !shadow_graph.nodes.contains_key(&edge.from) {
+                        batch_errors.push(invalid_op(
+                            Some(edge.from),
+                            format!(
+                                "missing source node at ({}, {})",
+                                edge.from.col, edge.from.row
+                            ),
+                        ));
+                        continue;
+                    }
+                    if !shadow_graph.nodes.contains_key(&edge.to_node) {
+                        batch_errors.push(invalid_op(
+                            Some(edge.to_node),
+                            format!(
+                                "missing target node at ({}, {})",
+                                edge.to_node.col, edge.to_node.row
+                            ),
+                        ));
+                        continue;
+                    }
+                    if edge.to_param.trim().is_empty() {
+                        batch_errors.push(invalid_op(
+                            Some(edge.to_node),
+                            "edge target param cannot be empty",
+                        ));
+                        continue;
+                    }
+                    if let Err(reject) = validate_edge_connect(
+                        &shadow_graph,
+                        registry,
+                        &edge.from,
+                        &edge.to_node,
+                        edge.to_param.as_str(),
+                    ) {
+                        batch_errors.push(invalid_op(
+                            Some(edge.to_node),
+                            reject
+                                .detail
+                                .unwrap_or_else(|| "edge connection rejected".to_string()),
+                        ));
+                        continue;
+                    }
+
+                    let staged_edge = Edge {
+                        id: EdgeId::new(),
+                        from: edge.from,
+                        to_node: edge.to_node,
+                        to_param: edge.to_param.clone(),
+                    };
+                    shadow_graph
+                        .edges
+                        .insert(staged_edge.id.clone(), staged_edge.clone());
+                    staged_edges.push(staged_edge);
+                }
+
+                if !batch_errors.is_empty() {
+                    errors.extend(batch_errors);
+                    continue;
+                }
+
+                let mut auto_wire_outcome = ApplyOpsOutcome::default();
+                let mut auto_wire_inverse_chunks = Vec::<Vec<GraphOp>>::new();
+                if *auto_wire {
+                    for entry in nodes {
+                        auto_wire_node(
+                            &mut shadow_graph,
+                            registry,
+                            &entry.position,
+                            &mut auto_wire_outcome,
+                            &mut auto_wire_inverse_chunks,
+                        );
+                    }
+                }
+
+                let mut batch_inverse = auto_wire_inverse_chunks
+                    .into_iter()
+                    .rev()
+                    .flat_map(|chunk| chunk.into_iter())
+                    .collect::<Vec<_>>();
+                batch_inverse.extend(staged_edges.iter().rev().map(|edge| {
+                    GraphOp::EdgeDisconnect {
+                        edge_id: edge.id.clone(),
+                    }
+                }));
+                batch_inverse.extend(nodes.iter().rev().map(|entry| GraphOp::NodeRemove {
+                    position: entry.position,
+                }));
+
+                *graph = shadow_graph;
+                outcome
+                    .removed_edges
+                    .extend(auto_wire_outcome.removed_edges.into_iter());
+                outcome.applied_ops.push(GraphOp::NodeBatchPlace {
+                    nodes: nodes.clone(),
+                    edges: edges.clone(),
+                    auto_wire: *auto_wire,
+                });
+                if !batch_inverse.is_empty() {
+                    inverse_chunks.push(batch_inverse);
+                }
             }
             GraphOp::NodeMove { from, to } => {
                 if from == to {
@@ -792,26 +1092,26 @@ pub fn apply_ops_to_graph(
                 }
                 if graph.nodes.contains_key(to) {
                     errors.push(invalid_op(
-                        Some(to.clone()),
+                        Some(*to),
                         format!("target cell already occupied at ({}, {})", to.col, to.row),
                     ));
                     continue;
                 }
                 let Some(node) = graph.nodes.remove(from) else {
                     errors.push(invalid_op(
-                        Some(from.clone()),
+                        Some(*from),
                         format!("missing source node at ({}, {})", from.col, from.row),
                     ));
                     continue;
                 };
-                graph.nodes.insert(to.clone(), node);
+                graph.nodes.insert(*to, node);
 
                 for edge in graph.edges.values_mut() {
                     if edge.from == *from {
-                        edge.from = to.clone();
+                        edge.from = *to;
                     }
                     if edge.to_node == *from {
-                        edge.to_node = to.clone();
+                        edge.to_node = *to;
                     }
                 }
                 let mut removed_for_move = Vec::new();
@@ -821,24 +1121,24 @@ pub fn apply_ops_to_graph(
                     .extend(removed_for_move.iter().cloned());
 
                 let mut inverse = vec![GraphOp::NodeMove {
-                    from: to.clone(),
-                    to: from.clone(),
+                    from: *to,
+                    to: *from,
                 }];
                 for removed in &removed_for_move {
                     let mut restored = removed.clone();
                     if restored.from == *to {
-                        restored.from = from.clone();
+                        restored.from = *from;
                     }
                     if restored.to_node == *to {
-                        restored.to_node = from.clone();
+                        restored.to_node = *from;
                     }
                     inverse.push(edge_connect_from(&restored));
                 }
                 inverse_chunks.push(inverse);
 
                 outcome.applied_ops.push(GraphOp::NodeMove {
-                    from: from.clone(),
-                    to: to.clone(),
+                    from: *from,
+                    to: *to,
                 });
             }
             GraphOp::NodeSwap { a, b } => {
@@ -853,14 +1153,14 @@ pub fn apply_ops_to_graph(
                 }
                 if !graph.nodes.contains_key(a) {
                     errors.push(invalid_op(
-                        Some(a.clone()),
+                        Some(*a),
                         format!("missing node at ({}, {})", a.col, a.row),
                     ));
                     continue;
                 }
                 if !graph.nodes.contains_key(b) {
                     errors.push(invalid_op(
-                        Some(b.clone()),
+                        Some(*b),
                         format!("missing node at ({}, {})", b.col, b.row),
                     ));
                     continue;
@@ -874,8 +1174,8 @@ pub fn apply_ops_to_graph(
                     .nodes
                     .remove(b)
                     .expect("checked node existence before swap");
-                graph.nodes.insert(a.clone(), node_b);
-                graph.nodes.insert(b.clone(), node_a);
+                graph.nodes.insert(*a, node_b);
+                graph.nodes.insert(*b, node_a);
 
                 for edge in graph.edges.values_mut() {
                     swap_rewrite_pos(&mut edge.from, a, b);
@@ -889,10 +1189,7 @@ pub fn apply_ops_to_graph(
                     .removed_edges
                     .extend(removed_for_swap.iter().cloned());
 
-                let mut inverse = vec![GraphOp::NodeSwap {
-                    a: a.clone(),
-                    b: b.clone(),
-                }];
+                let mut inverse = vec![GraphOp::NodeSwap { a: *a, b: *b }];
                 for removed in &removed_for_swap {
                     let mut restored = removed.clone();
                     swap_rewrite_pos(&mut restored.from, a, b);
@@ -901,10 +1198,7 @@ pub fn apply_ops_to_graph(
                 }
                 inverse_chunks.push(inverse);
 
-                outcome.applied_ops.push(GraphOp::NodeSwap {
-                    a: a.clone(),
-                    b: b.clone(),
-                });
+                outcome.applied_ops.push(GraphOp::NodeSwap { a: *a, b: *b });
             }
             GraphOp::NodeRemove { position } => {
                 if !ensure_in_bounds(&mut errors, position, "node_remove", graph) {
@@ -912,7 +1206,7 @@ pub fn apply_ops_to_graph(
                 }
                 let Some(removed_node) = graph.nodes.remove(position) else {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("missing node at ({}, {})", position.col, position.row),
                     ));
                     continue;
@@ -934,32 +1228,32 @@ pub fn apply_ops_to_graph(
                     .extend(removed_for_node.iter().cloned());
 
                 let mut inverse = vec![GraphOp::NodePlace {
-                    position: position.clone(),
+                    position: *position,
                     piece_id: removed_node.piece_id.clone(),
                     inline_params: removed_node.inline_params.clone(),
                 }];
                 if removed_node.label.is_some() {
                     inverse.push(GraphOp::NodeSetLabel {
-                        position: position.clone(),
+                        position: *position,
                         label: removed_node.label.clone(),
                     });
                 }
                 if removed_node.node_state.is_some() {
                     inverse.push(GraphOp::NodeSetState {
-                        position: position.clone(),
+                        position: *position,
                         state: removed_node.node_state.clone(),
                     });
                 }
                 for (param_id, side) in &removed_node.input_sides {
                     inverse.push(GraphOp::ParamSetSide {
-                        position: position.clone(),
+                        position: *position,
                         param_id: param_id.clone(),
                         side: *side,
                     });
                 }
                 if let Some(side) = removed_node.output_side {
                     inverse.push(GraphOp::OutputSetSide {
-                        position: position.clone(),
+                        position: *position,
                         side,
                     });
                 }
@@ -967,7 +1261,7 @@ pub fn apply_ops_to_graph(
                 inverse_chunks.push(inverse);
 
                 outcome.applied_ops.push(GraphOp::NodeRemove {
-                    position: position.clone(),
+                    position: *position,
                 });
             }
             GraphOp::EdgeConnect {
@@ -984,21 +1278,21 @@ pub fn apply_ops_to_graph(
                 }
                 if !graph.nodes.contains_key(from) {
                     errors.push(invalid_op(
-                        Some(from.clone()),
+                        Some(*from),
                         format!("missing source node at ({}, {})", from.col, from.row),
                     ));
                     continue;
                 }
                 if !graph.nodes.contains_key(to_node) {
                     errors.push(invalid_op(
-                        Some(to_node.clone()),
+                        Some(*to_node),
                         format!("missing target node at ({}, {})", to_node.col, to_node.row),
                     ));
                     continue;
                 }
                 if to_param.trim().is_empty() {
                     errors.push(invalid_op(
-                        Some(to_node.clone()),
+                        Some(*to_node),
                         "edge target param cannot be empty",
                     ));
                     continue;
@@ -1009,7 +1303,7 @@ pub fn apply_ops_to_graph(
                     && !restoring_exact_edge
                 {
                     errors.push(invalid_op(
-                        Some(to_node.clone()),
+                        Some(*to_node),
                         reject
                             .detail
                             .unwrap_or_else(|| "edge connection rejected".to_string()),
@@ -1020,22 +1314,22 @@ pub fn apply_ops_to_graph(
                 let edge_id = edge_id.clone().unwrap_or_else(EdgeId::new);
                 if graph.edges.contains_key(&edge_id) {
                     errors.push(invalid_op(
-                        Some(to_node.clone()),
+                        Some(*to_node),
                         format!("edge id '{}' already exists", edge_id.0),
                     ));
                     continue;
                 }
                 let edge = Edge {
                     id: edge_id.clone(),
-                    from: from.clone(),
-                    to_node: to_node.clone(),
+                    from: *from,
+                    to_node: *to_node,
                     to_param: to_param.clone(),
                 };
                 graph.edges.insert(edge.id.clone(), edge);
                 outcome.applied_ops.push(GraphOp::EdgeConnect {
                     edge_id: Some(edge_id.clone()),
-                    from: from.clone(),
-                    to_node: to_node.clone(),
+                    from: *from,
+                    to_node: *to_node,
                     to_param: to_param.clone(),
                 });
                 inverse_chunks.push(vec![GraphOp::EdgeDisconnect { edge_id }]);
@@ -1060,14 +1354,14 @@ pub fn apply_ops_to_graph(
                 }
                 let Some(target_node) = graph.nodes.get_mut(position) else {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("missing node at ({}, {})", position.col, position.row),
                     ));
                     continue;
                 };
                 let Some(piece) = registry.get(target_node.piece_id.as_str()) else {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("unknown piece '{}'", target_node.piece_id),
                     ));
                     continue;
@@ -1075,21 +1369,21 @@ pub fn apply_ops_to_graph(
                 let Some(param_def) = piece.def().params.iter().find(|item| item.id == *param_id)
                 else {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("unknown param '{}'", param_id),
                     ));
                     continue;
                 };
                 if !param_def.schema.can_inline() {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("inline value is not allowed for '{}'", param_id),
                     ));
                     continue;
                 }
                 if !param_def.schema.validate_inline_value(value) {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("inline value has wrong type for '{}'", param_id),
                     ));
                     continue;
@@ -1105,19 +1399,19 @@ pub fn apply_ops_to_graph(
                     .inline_params
                     .insert(param_id.clone(), value.clone());
                 outcome.applied_ops.push(GraphOp::ParamSetInline {
-                    position: position.clone(),
+                    position: *position,
                     param_id: param_id.clone(),
                     value: value.clone(),
                 });
                 if let Some(previous) = previous {
                     inverse_chunks.push(vec![GraphOp::ParamSetInline {
-                        position: position.clone(),
+                        position: *position,
                         param_id: param_id.clone(),
                         value: previous,
                     }]);
                 } else {
                     inverse_chunks.push(vec![GraphOp::ParamClearInline {
-                        position: position.clone(),
+                        position: *position,
                         param_id: param_id.clone(),
                     }]);
                 }
@@ -1128,21 +1422,21 @@ pub fn apply_ops_to_graph(
                 }
                 let Some(target_node) = graph.nodes.get_mut(position) else {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("missing node at ({}, {})", position.col, position.row),
                     ));
                     continue;
                 };
                 let Some(piece) = registry.get(target_node.piece_id.as_str()) else {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("unknown piece '{}'", target_node.piece_id),
                     ));
                     continue;
                 };
                 if !piece.def().params.iter().any(|item| item.id == *param_id) {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("unknown param '{}'", param_id),
                     ));
                     continue;
@@ -1152,11 +1446,11 @@ pub fn apply_ops_to_graph(
                     continue;
                 };
                 outcome.applied_ops.push(GraphOp::ParamClearInline {
-                    position: position.clone(),
+                    position: *position,
                     param_id: param_id.clone(),
                 });
                 inverse_chunks.push(vec![GraphOp::ParamSetInline {
-                    position: position.clone(),
+                    position: *position,
                     param_id: param_id.clone(),
                     value: previous,
                 }]);
@@ -1171,21 +1465,21 @@ pub fn apply_ops_to_graph(
                 }
                 let Some(target_node) = graph.nodes.get_mut(position) else {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("missing node at ({}, {})", position.col, position.row),
                     ));
                     continue;
                 };
                 let Some(piece) = registry.get(target_node.piece_id.as_str()) else {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("unknown piece '{}'", target_node.piece_id),
                     ));
                     continue;
                 };
                 if !piece.def().params.iter().any(|param| param.id == *param_id) {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("unknown param '{}'", param_id),
                     ));
                     continue;
@@ -1199,19 +1493,19 @@ pub fn apply_ops_to_graph(
                 }
                 let previous = target_node.input_sides.insert(param_id.clone(), *side);
                 outcome.applied_ops.push(GraphOp::ParamSetSide {
-                    position: position.clone(),
+                    position: *position,
                     param_id: param_id.clone(),
                     side: *side,
                 });
                 if let Some(previous) = previous {
                     inverse_chunks.push(vec![GraphOp::ParamSetSide {
-                        position: position.clone(),
+                        position: *position,
                         param_id: param_id.clone(),
                         side: previous,
                     }]);
                 } else {
                     inverse_chunks.push(vec![GraphOp::ParamClearSide {
-                        position: position.clone(),
+                        position: *position,
                         param_id: param_id.clone(),
                     }]);
                 }
@@ -1222,21 +1516,21 @@ pub fn apply_ops_to_graph(
                 }
                 let Some(target_node) = graph.nodes.get_mut(position) else {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("missing node at ({}, {})", position.col, position.row),
                     ));
                     continue;
                 };
                 let Some(piece) = registry.get(target_node.piece_id.as_str()) else {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("unknown piece '{}'", target_node.piece_id),
                     ));
                     continue;
                 };
                 if !piece.def().params.iter().any(|param| param.id == *param_id) {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("unknown param '{}'", param_id),
                     ));
                     continue;
@@ -1246,11 +1540,11 @@ pub fn apply_ops_to_graph(
                     continue;
                 };
                 outcome.applied_ops.push(GraphOp::ParamClearSide {
-                    position: position.clone(),
+                    position: *position,
                     param_id: param_id.clone(),
                 });
                 inverse_chunks.push(vec![GraphOp::ParamSetSide {
-                    position: position.clone(),
+                    position: *position,
                     param_id: param_id.clone(),
                     side: previous,
                 }]);
@@ -1261,21 +1555,21 @@ pub fn apply_ops_to_graph(
                 }
                 let Some(target_node) = graph.nodes.get_mut(position) else {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("missing node at ({}, {})", position.col, position.row),
                     ));
                     continue;
                 };
                 let Some(piece) = registry.get(target_node.piece_id.as_str()) else {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("unknown piece '{}'", target_node.piece_id),
                     ));
                     continue;
                 };
                 if piece.def().output_type.is_none() {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         "cannot set output side on terminal piece",
                     ));
                     continue;
@@ -1285,17 +1579,17 @@ pub fn apply_ops_to_graph(
                 }
                 let previous = target_node.output_side.replace(*side);
                 outcome.applied_ops.push(GraphOp::OutputSetSide {
-                    position: position.clone(),
+                    position: *position,
                     side: *side,
                 });
                 if let Some(previous) = previous {
                     inverse_chunks.push(vec![GraphOp::OutputSetSide {
-                        position: position.clone(),
+                        position: *position,
                         side: previous,
                     }]);
                 } else {
                     inverse_chunks.push(vec![GraphOp::OutputClearSide {
-                        position: position.clone(),
+                        position: *position,
                     }]);
                 }
             }
@@ -1305,14 +1599,14 @@ pub fn apply_ops_to_graph(
                 }
                 let Some(target_node) = graph.nodes.get_mut(position) else {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("missing node at ({}, {})", position.col, position.row),
                     ));
                     continue;
                 };
                 let Some(piece) = registry.get(target_node.piece_id.as_str()) else {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("unknown piece '{}'", target_node.piece_id),
                     ));
                     continue;
@@ -1325,10 +1619,10 @@ pub fn apply_ops_to_graph(
                     continue;
                 };
                 outcome.applied_ops.push(GraphOp::OutputClearSide {
-                    position: position.clone(),
+                    position: *position,
                 });
                 inverse_chunks.push(vec![GraphOp::OutputSetSide {
-                    position: position.clone(),
+                    position: *position,
                     side: previous,
                 }]);
             }
@@ -1338,7 +1632,7 @@ pub fn apply_ops_to_graph(
                 }
                 if !graph.nodes.contains_key(position) {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("missing node at ({}, {})", position.col, position.row),
                     ));
                     continue;
@@ -1351,7 +1645,7 @@ pub fn apply_ops_to_graph(
                 }
                 let Some(target_node) = graph.nodes.get_mut(position) else {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("missing node at ({}, {})", position.col, position.row),
                     ));
                     continue;
@@ -1359,11 +1653,11 @@ pub fn apply_ops_to_graph(
                 let previous = target_node.label.clone();
                 target_node.label = label.clone();
                 outcome.applied_ops.push(GraphOp::NodeSetLabel {
-                    position: position.clone(),
+                    position: *position,
                     label: label.clone(),
                 });
                 inverse_chunks.push(vec![GraphOp::NodeSetLabel {
-                    position: position.clone(),
+                    position: *position,
                     label: previous,
                 }]);
             }
@@ -1373,7 +1667,7 @@ pub fn apply_ops_to_graph(
                 }
                 let Some(target_node) = graph.nodes.get_mut(position) else {
                     errors.push(invalid_op(
-                        Some(position.clone()),
+                        Some(*position),
                         format!("missing node at ({}, {})", position.col, position.row),
                     ));
                     continue;
@@ -1381,11 +1675,11 @@ pub fn apply_ops_to_graph(
                 let previous = target_node.node_state.clone();
                 target_node.node_state = state.clone();
                 outcome.applied_ops.push(GraphOp::NodeSetState {
-                    position: position.clone(),
+                    position: *position,
                     state: state.clone(),
                 });
                 inverse_chunks.push(vec![GraphOp::NodeSetState {
-                    position: position.clone(),
+                    position: *position,
                     state: previous,
                 }]);
             }
@@ -1408,7 +1702,7 @@ pub fn apply_ops_to_graph(
                         if in_bounds(pos, graph) {
                             None
                         } else {
-                            Some((pos.clone(), node.clone()))
+                            Some((*pos, node.clone()))
                         }
                     })
                     .collect::<Vec<_>>();
@@ -1447,32 +1741,32 @@ pub fn apply_ops_to_graph(
                 }];
                 for (position, node) in &removed_nodes {
                     inverse.push(GraphOp::NodePlace {
-                        position: position.clone(),
+                        position: *position,
                         piece_id: node.piece_id.clone(),
                         inline_params: node.inline_params.clone(),
                     });
                     if node.label.is_some() {
                         inverse.push(GraphOp::NodeSetLabel {
-                            position: position.clone(),
+                            position: *position,
                             label: node.label.clone(),
                         });
                     }
                     if node.node_state.is_some() {
                         inverse.push(GraphOp::NodeSetState {
-                            position: position.clone(),
+                            position: *position,
                             state: node.node_state.clone(),
                         });
                     }
                     for (param_id, side) in &node.input_sides {
                         inverse.push(GraphOp::ParamSetSide {
-                            position: position.clone(),
+                            position: *position,
                             param_id: param_id.clone(),
                             side: *side,
                         });
                     }
                     if let Some(side) = node.output_side {
                         inverse.push(GraphOp::OutputSetSide {
-                            position: position.clone(),
+                            position: *position,
                             side,
                         });
                     }
@@ -1495,6 +1789,40 @@ pub fn apply_ops_to_graph(
     }
 }
 
+pub fn apply_ops_to_graph_cached(
+    graph: &mut Graph,
+    registry: &PieceRegistry,
+    ops: &[GraphOp],
+    cache: &mut CompileCache,
+) -> Result<ApplyOpsOutcome, Vec<Diagnostic>> {
+    let explicit_disconnect_targets = ops
+        .iter()
+        .filter_map(|op| match op {
+            GraphOp::EdgeDisconnect { edge_id } => graph
+                .edges
+                .get(edge_id)
+                .map(|edge| (edge_id.clone(), edge.to_node)),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    match apply_ops_to_graph(graph, registry, ops) {
+        Ok(outcome) => {
+            cache.invalidate_from_apply_outcome(
+                graph,
+                &outcome.applied_ops,
+                &outcome.removed_edges,
+                &explicit_disconnect_targets,
+            );
+            Ok(outcome)
+        }
+        Err(errors) => {
+            cache.clear();
+            Err(errors)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1504,11 +1832,15 @@ mod tests {
     use super::*;
     use crate::ast::Expr;
     use crate::diagnostics::DiagnosticKind;
+    use crate::graph::{BatchPlaceEdge, BatchPlaceEntry};
     use crate::piece::{
         ParamDef, ParamInlineMode, ParamSchema, ParamValueKind, Piece, PieceDef, PieceInputs,
     };
     use crate::piece_registry::PieceRegistry;
-    use crate::types::{EdgeId, PieceCategory, PieceSemanticKind, PortType, TileSide};
+    use crate::types::{
+        DomainBridgeKind, EdgeId, ExecutionDomain, PieceCategory, PieceSemanticKind, PortType,
+        TileSide,
+    };
 
     struct TestPiece {
         def: PieceDef,
@@ -1554,6 +1886,7 @@ mod tests {
                     output_type: Some(pattern_port()),
                     output_side: Some(TileSide::RIGHT),
                     description: None,
+                    tags: vec![],
                 },
             }
         }
@@ -1578,6 +1911,7 @@ mod tests {
                     output_type: Some(pattern_port()),
                     output_side: Some(TileSide::RIGHT),
                     description: None,
+                    tags: vec![],
                 },
             }
         }
@@ -1602,6 +1936,7 @@ mod tests {
                     output_type: None,
                     output_side: None,
                     description: None,
+                    tags: vec![],
                 },
             }
         }
@@ -1623,6 +1958,382 @@ mod tests {
         registry.register(TestPiece::transform("strudel.fast"));
         registry.register(TestPiece::terminal("strudel.output"));
         registry
+    }
+
+    struct GenericProbePiece {
+        def: PieceDef,
+    }
+
+    impl GenericProbePiece {
+        fn number_source() -> Self {
+            Self {
+                def: PieceDef {
+                    id: "test.number_source".into(),
+                    label: "test.number_source".into(),
+                    category: PieceCategory::Generator,
+                    semantic_kind: PieceSemanticKind::Literal,
+                    namespace: "core".into(),
+                    params: vec![],
+                    output_type: Some(PortType::number()),
+                    output_side: Some(TileSide::RIGHT),
+                    description: None,
+                    tags: vec![],
+                },
+            }
+        }
+
+        fn forward() -> Self {
+            Self {
+                def: PieceDef {
+                    id: "test.forward".into(),
+                    label: "test.forward".into(),
+                    category: PieceCategory::Transform,
+                    semantic_kind: PieceSemanticKind::Operator,
+                    namespace: "core".into(),
+                    params: vec![ParamDef {
+                        id: "value".into(),
+                        label: "value".into(),
+                        side: TileSide::LEFT,
+                        schema: ParamSchema::Custom {
+                            port_type: PortType::any(),
+                            value_kind: ParamValueKind::Json,
+                            default: None,
+                            can_inline: false,
+                            inline_mode: ParamInlineMode::Literal,
+                            min: None,
+                            max: None,
+                        },
+                        text_semantics: Default::default(),
+                        variadic_group: None,
+                        required: true,
+                    }],
+                    output_type: Some(PortType::any()),
+                    output_side: Some(TileSide::RIGHT),
+                    description: None,
+                    tags: vec![],
+                },
+            }
+        }
+
+        fn dual_target() -> Self {
+            Self {
+                def: PieceDef {
+                    id: "test.dual_target".into(),
+                    label: "test.dual_target".into(),
+                    category: PieceCategory::Transform,
+                    semantic_kind: PieceSemanticKind::Operator,
+                    namespace: "core".into(),
+                    params: vec![
+                        ParamDef {
+                            id: "text".into(),
+                            label: "text".into(),
+                            side: TileSide::LEFT,
+                            schema: ParamSchema::Text {
+                                default: String::new(),
+                                can_inline: false,
+                            },
+                            text_semantics: Default::default(),
+                            variadic_group: None,
+                            required: false,
+                        },
+                        ParamDef {
+                            id: "number".into(),
+                            label: "number".into(),
+                            side: TileSide::LEFT,
+                            schema: ParamSchema::Number {
+                                default: 0.0,
+                                min: None,
+                                max: None,
+                                can_inline: false,
+                            },
+                            text_semantics: Default::default(),
+                            variadic_group: None,
+                            required: false,
+                        },
+                    ],
+                    output_type: Some(PortType::any()),
+                    output_side: Some(TileSide::RIGHT),
+                    description: None,
+                    tags: vec![],
+                },
+            }
+        }
+
+        fn number_source_with_domain(id: &str, domain: ExecutionDomain) -> Self {
+            Self {
+                def: PieceDef {
+                    id: id.into(),
+                    label: id.into(),
+                    category: PieceCategory::Generator,
+                    semantic_kind: PieceSemanticKind::Literal,
+                    namespace: "core".into(),
+                    params: vec![],
+                    output_type: Some(PortType::number().with_domain(domain)),
+                    output_side: Some(TileSide::RIGHT),
+                    description: None,
+                    tags: vec![],
+                },
+            }
+        }
+
+        fn domain_target(id: &str, expected: PortType) -> Self {
+            Self {
+                def: PieceDef {
+                    id: id.into(),
+                    label: id.into(),
+                    category: PieceCategory::Transform,
+                    semantic_kind: PieceSemanticKind::Operator,
+                    namespace: "core".into(),
+                    params: vec![ParamDef {
+                        id: "value".into(),
+                        label: "value".into(),
+                        side: TileSide::LEFT,
+                        schema: ParamSchema::Custom {
+                            port_type: expected,
+                            value_kind: ParamValueKind::Json,
+                            default: None,
+                            can_inline: false,
+                            inline_mode: ParamInlineMode::Literal,
+                            min: None,
+                            max: None,
+                        },
+                        text_semantics: Default::default(),
+                        variadic_group: None,
+                        required: true,
+                    }],
+                    output_type: Some(PortType::any().with_unspecified_domain()),
+                    output_side: Some(TileSide::RIGHT),
+                    description: None,
+                    tags: vec![],
+                },
+            }
+        }
+    }
+
+    impl Piece for GenericProbePiece {
+        fn def(&self) -> &PieceDef {
+            &self.def
+        }
+
+        fn compile(&self, _inputs: &PieceInputs, _inline_params: &BTreeMap<String, Value>) -> Expr {
+            Expr::ident(self.def.id.clone())
+        }
+
+        fn infer_output_type(
+            &self,
+            input_types: &BTreeMap<String, PortType>,
+            _inline_params: &BTreeMap<String, Value>,
+        ) -> Option<PortType> {
+            if self.def.id == "test.forward" {
+                input_types
+                    .get("value")
+                    .cloned()
+                    .or_else(|| Some(PortType::any()))
+            } else {
+                self.def.output_type.clone()
+            }
+        }
+    }
+
+    fn inferred_probe_registry() -> PieceRegistry {
+        let mut registry = PieceRegistry::new();
+        registry.register(GenericProbePiece::number_source());
+        registry.register(GenericProbePiece::forward());
+        registry.register(GenericProbePiece::dual_target());
+        registry
+    }
+
+    fn domain_probe_registry() -> PieceRegistry {
+        let mut registry = PieceRegistry::new();
+        registry.register(GenericProbePiece::number_source_with_domain(
+            "test.control_number_source",
+            ExecutionDomain::Control,
+        ));
+        registry.register(GenericProbePiece::number_source_with_domain(
+            "test.audio_number_source",
+            ExecutionDomain::Audio,
+        ));
+        registry.register(GenericProbePiece::domain_target(
+            "test.audio_target",
+            PortType::number().with_domain(ExecutionDomain::Audio),
+        ));
+        registry.register(GenericProbePiece::domain_target(
+            "test.event_target",
+            PortType::number().with_domain(ExecutionDomain::Event),
+        ));
+        registry
+    }
+
+    fn inferred_probe_graph() -> Graph {
+        let source_pos = GridPos { col: 0, row: 0 };
+        let forward_pos = GridPos { col: 1, row: 0 };
+        let target_pos = GridPos { col: 2, row: 0 };
+        let edge = Edge {
+            id: EdgeId::new(),
+            from: source_pos,
+            to_node: forward_pos,
+            to_param: "value".into(),
+        };
+
+        Graph {
+            nodes: BTreeMap::from([
+                (
+                    source_pos,
+                    Node {
+                        piece_id: "test.number_source".into(),
+                        inline_params: BTreeMap::new(),
+                        input_sides: BTreeMap::new(),
+                        output_side: None,
+                        label: None,
+                        node_state: None,
+                    },
+                ),
+                (
+                    forward_pos,
+                    Node {
+                        piece_id: "test.forward".into(),
+                        inline_params: BTreeMap::new(),
+                        input_sides: BTreeMap::from([("value".into(), TileSide::LEFT)]),
+                        output_side: None,
+                        label: None,
+                        node_state: None,
+                    },
+                ),
+                (
+                    target_pos,
+                    Node {
+                        piece_id: "test.dual_target".into(),
+                        inline_params: BTreeMap::new(),
+                        input_sides: BTreeMap::from([
+                            ("text".into(), TileSide::LEFT),
+                            ("number".into(), TileSide::LEFT),
+                        ]),
+                        output_side: None,
+                        label: None,
+                        node_state: None,
+                    },
+                ),
+            ]),
+            edges: BTreeMap::from([(edge.id.clone(), edge)]),
+            name: "inferred_probe".into(),
+            cols: 3,
+            rows: 1,
+        }
+    }
+
+    fn direct_probe_graph(source_piece_id: &str, target_piece_id: &str) -> Graph {
+        let source_pos = GridPos { col: 0, row: 0 };
+        let target_pos = GridPos { col: 1, row: 0 };
+
+        Graph {
+            nodes: BTreeMap::from([
+                (
+                    source_pos,
+                    Node {
+                        piece_id: source_piece_id.into(),
+                        inline_params: BTreeMap::new(),
+                        input_sides: BTreeMap::new(),
+                        output_side: None,
+                        label: None,
+                        node_state: None,
+                    },
+                ),
+                (
+                    target_pos,
+                    Node {
+                        piece_id: target_piece_id.into(),
+                        inline_params: BTreeMap::new(),
+                        input_sides: BTreeMap::from([("value".into(), TileSide::LEFT)]),
+                        output_side: None,
+                        label: None,
+                        node_state: None,
+                    },
+                ),
+            ]),
+            edges: BTreeMap::new(),
+            name: "direct_probe".into(),
+            cols: 2,
+            rows: 1,
+        }
+    }
+
+    #[test]
+    fn pick_target_param_uses_inferred_source_output_type() {
+        let registry = inferred_probe_registry();
+        let graph = inferred_probe_graph();
+
+        let probe = pick_target_param_for_edge(
+            &graph,
+            &registry,
+            &GridPos { col: 1, row: 0 },
+            &GridPos { col: 2, row: 0 },
+        );
+
+        assert_eq!(probe.reason, None);
+        assert_eq!(probe.to_param.as_deref(), Some("number"));
+    }
+
+    #[test]
+    fn probe_edge_connect_reports_bridgeable_domain_boundary() {
+        let registry = domain_probe_registry();
+        let graph = direct_probe_graph("test.control_number_source", "test.audio_target");
+
+        let probe = probe_edge_connect(
+            &graph,
+            &registry,
+            &GridPos { col: 0, row: 0 },
+            &GridPos { col: 1, row: 0 },
+            Some("value"),
+        );
+
+        assert_eq!(probe.reason, None);
+        assert_eq!(probe.to_param.as_deref(), Some("value"));
+        assert_eq!(
+            probe.implicit_bridge,
+            Some(DomainBridgeKind::ControlToAudio)
+        );
+    }
+
+    #[test]
+    fn pick_target_param_reports_bridgeable_domain_boundary() {
+        let registry = domain_probe_registry();
+        let graph = direct_probe_graph("test.control_number_source", "test.audio_target");
+
+        let probe = probe_edge_connect(
+            &graph,
+            &registry,
+            &GridPos { col: 0, row: 0 },
+            &GridPos { col: 1, row: 0 },
+            None,
+        );
+
+        assert_eq!(probe.reason, None);
+        assert_eq!(probe.to_param.as_deref(), Some("value"));
+        assert_eq!(
+            probe.implicit_bridge,
+            Some(DomainBridgeKind::ControlToAudio)
+        );
+    }
+
+    #[test]
+    fn probe_edge_connect_rejects_unsupported_domain_boundary() {
+        let registry = domain_probe_registry();
+        let graph = direct_probe_graph("test.audio_number_source", "test.event_target");
+
+        let probe = probe_edge_connect(
+            &graph,
+            &registry,
+            &GridPos { col: 0, row: 0 },
+            &GridPos { col: 1, row: 0 },
+            Some("value"),
+        );
+
+        assert_eq!(
+            probe.reason,
+            Some(EdgeConnectProbeReason::UnsupportedDomain)
+        );
+        assert_eq!(probe.to_param, None);
+        assert_eq!(probe.implicit_bridge, None);
     }
 
     fn sample_swap_graph() -> Graph {
@@ -1688,6 +2399,16 @@ mod tests {
 
     fn canonical_json(graph: &Graph) -> String {
         serde_json::to_string(graph).expect("serialize")
+    }
+
+    fn empty_graph(name: &str) -> Graph {
+        Graph {
+            nodes: BTreeMap::new(),
+            edges: BTreeMap::new(),
+            name: name.to_string(),
+            cols: 9,
+            rows: 9,
+        }
     }
 
     #[test]
@@ -1968,5 +2689,318 @@ mod tests {
         apply_ops_to_graph(&mut graph, &registry, outcome.undo_ops.as_slice())
             .expect("undo should restore removed edge");
         assert_eq!(graph.edges.len(), 1);
+    }
+
+    #[test]
+    fn node_batch_place_places_nodes_and_explicit_edges() {
+        let registry = sample_registry();
+        let mut graph = empty_graph("batch-explicit");
+
+        let outcome = apply_ops_to_graph(
+            &mut graph,
+            &registry,
+            &[GraphOp::NodeBatchPlace {
+                nodes: vec![
+                    BatchPlaceEntry {
+                        position: GridPos { col: 0, row: 0 },
+                        piece_id: "strudel.sound".into(),
+                        inline_params: BTreeMap::from([(
+                            "value".into(),
+                            Value::String("bd".into()),
+                        )]),
+                        input_sides: BTreeMap::new(),
+                        output_side: None,
+                        label: Some("src".into()),
+                    },
+                    BatchPlaceEntry {
+                        position: GridPos { col: 1, row: 0 },
+                        piece_id: "strudel.output".into(),
+                        inline_params: BTreeMap::new(),
+                        input_sides: BTreeMap::from([("pattern".into(), TileSide::LEFT)]),
+                        output_side: None,
+                        label: Some("out".into()),
+                    },
+                ],
+                edges: vec![BatchPlaceEdge {
+                    from: GridPos { col: 0, row: 0 },
+                    to_node: GridPos { col: 1, row: 0 },
+                    to_param: "pattern".into(),
+                }],
+                auto_wire: false,
+            }],
+        )
+        .expect("batch place should succeed");
+
+        assert_eq!(graph.nodes.len(), 2);
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(
+            graph
+                .nodes
+                .get(&GridPos { col: 0, row: 0 })
+                .and_then(|node| node.label.as_deref()),
+            Some("src")
+        );
+        assert!(
+            outcome
+                .applied_ops
+                .iter()
+                .any(|op| matches!(op, GraphOp::NodeBatchPlace { .. }))
+        );
+    }
+
+    #[test]
+    fn node_batch_place_is_atomic_on_invalid_piece() {
+        let registry = sample_registry();
+        let mut graph = empty_graph("batch-atomic");
+        let before = canonical_json(&graph);
+
+        let errors = apply_ops_to_graph(
+            &mut graph,
+            &registry,
+            &[GraphOp::NodeBatchPlace {
+                nodes: vec![
+                    BatchPlaceEntry {
+                        position: GridPos { col: 0, row: 0 },
+                        piece_id: "strudel.sound".into(),
+                        inline_params: BTreeMap::new(),
+                        input_sides: BTreeMap::new(),
+                        output_side: None,
+                        label: None,
+                    },
+                    BatchPlaceEntry {
+                        position: GridPos { col: 1, row: 0 },
+                        piece_id: "missing.piece".into(),
+                        inline_params: BTreeMap::new(),
+                        input_sides: BTreeMap::new(),
+                        output_side: None,
+                        label: None,
+                    },
+                ],
+                edges: vec![],
+                auto_wire: false,
+            }],
+        )
+        .expect_err("batch should fail atomically");
+
+        assert_eq!(canonical_json(&graph), before);
+        assert!(
+            errors
+                .iter()
+                .any(|diag| matches!(diag.kind, DiagnosticKind::InvalidOperation { .. }))
+        );
+    }
+
+    #[test]
+    fn node_batch_place_rejects_out_of_bounds_nodes() {
+        let registry = sample_registry();
+        let mut graph = empty_graph("batch-bounds");
+
+        let errors = apply_ops_to_graph(
+            &mut graph,
+            &registry,
+            &[GraphOp::NodeBatchPlace {
+                nodes: vec![BatchPlaceEntry {
+                    position: GridPos { col: -1, row: 0 },
+                    piece_id: "strudel.sound".into(),
+                    inline_params: BTreeMap::new(),
+                    input_sides: BTreeMap::new(),
+                    output_side: None,
+                    label: None,
+                }],
+                edges: vec![],
+                auto_wire: false,
+            }],
+        )
+        .expect_err("out-of-bounds batch node should fail");
+
+        assert!(
+            errors
+                .iter()
+                .any(|diag| matches!(diag.kind, DiagnosticKind::InvalidOperation { .. }))
+        );
+        assert!(graph.nodes.is_empty());
+    }
+
+    #[test]
+    fn node_batch_place_rejects_duplicate_positions() {
+        let registry = sample_registry();
+        let mut graph = empty_graph("batch-duplicate");
+
+        let errors = apply_ops_to_graph(
+            &mut graph,
+            &registry,
+            &[GraphOp::NodeBatchPlace {
+                nodes: vec![
+                    BatchPlaceEntry {
+                        position: GridPos { col: 0, row: 0 },
+                        piece_id: "strudel.sound".into(),
+                        inline_params: BTreeMap::new(),
+                        input_sides: BTreeMap::new(),
+                        output_side: None,
+                        label: None,
+                    },
+                    BatchPlaceEntry {
+                        position: GridPos { col: 0, row: 0 },
+                        piece_id: "strudel.output".into(),
+                        inline_params: BTreeMap::new(),
+                        input_sides: BTreeMap::from([("pattern".into(), TileSide::LEFT)]),
+                        output_side: None,
+                        label: None,
+                    },
+                ],
+                edges: vec![],
+                auto_wire: false,
+            }],
+        )
+        .expect_err("duplicate positions should fail");
+
+        assert!(
+            errors
+                .iter()
+                .any(|diag| matches!(diag.kind, DiagnosticKind::InvalidOperation { .. }))
+        );
+        assert!(graph.nodes.is_empty());
+    }
+
+    #[test]
+    fn node_batch_place_rejects_occupied_positions() {
+        let registry = sample_registry();
+        let mut graph = sample_swap_graph();
+        let before = canonical_json(&graph);
+
+        let errors = apply_ops_to_graph(
+            &mut graph,
+            &registry,
+            &[GraphOp::NodeBatchPlace {
+                nodes: vec![BatchPlaceEntry {
+                    position: GridPos { col: 0, row: 0 },
+                    piece_id: "strudel.output".into(),
+                    inline_params: BTreeMap::new(),
+                    input_sides: BTreeMap::from([("pattern".into(), TileSide::LEFT)]),
+                    output_side: None,
+                    label: None,
+                }],
+                edges: vec![],
+                auto_wire: false,
+            }],
+        )
+        .expect_err("occupied batch position should fail");
+
+        assert_eq!(canonical_json(&graph), before);
+        assert!(
+            errors
+                .iter()
+                .any(|diag| matches!(diag.kind, DiagnosticKind::InvalidOperation { .. }))
+        );
+    }
+
+    #[test]
+    fn node_batch_place_undo_restores_original_graph_state() {
+        let registry = sample_registry();
+        let mut graph = sample_swap_graph();
+        let before = canonical_json(&graph);
+
+        let outcome = apply_ops_to_graph(
+            &mut graph,
+            &registry,
+            &[GraphOp::NodeBatchPlace {
+                nodes: vec![
+                    BatchPlaceEntry {
+                        position: GridPos { col: 0, row: 1 },
+                        piece_id: "strudel.sound".into(),
+                        inline_params: BTreeMap::from([(
+                            "value".into(),
+                            Value::String("sn".into()),
+                        )]),
+                        input_sides: BTreeMap::new(),
+                        output_side: None,
+                        label: Some("added-source".into()),
+                    },
+                    BatchPlaceEntry {
+                        position: GridPos { col: 1, row: 1 },
+                        piece_id: "strudel.output".into(),
+                        inline_params: BTreeMap::new(),
+                        input_sides: BTreeMap::from([("pattern".into(), TileSide::LEFT)]),
+                        output_side: None,
+                        label: Some("added-output".into()),
+                    },
+                ],
+                edges: vec![BatchPlaceEdge {
+                    from: GridPos { col: 0, row: 1 },
+                    to_node: GridPos { col: 1, row: 1 },
+                    to_param: "pattern".into(),
+                }],
+                auto_wire: false,
+            }],
+        )
+        .expect("batch place should succeed");
+
+        apply_ops_to_graph(&mut graph, &registry, outcome.undo_ops.as_slice())
+            .expect("undo should restore original graph");
+        assert_eq!(canonical_json(&graph), before);
+    }
+
+    #[test]
+    fn node_batch_place_auto_wires_adjacent_batch_nodes() {
+        let registry = sample_registry();
+        let mut graph = empty_graph("batch-auto-wire");
+
+        let outcome = apply_ops_to_graph(
+            &mut graph,
+            &registry,
+            &[GraphOp::NodeBatchPlace {
+                nodes: vec![
+                    BatchPlaceEntry {
+                        position: GridPos { col: 0, row: 0 },
+                        piece_id: "strudel.sound".into(),
+                        inline_params: BTreeMap::from([(
+                            "value".into(),
+                            Value::String("bd".into()),
+                        )]),
+                        input_sides: BTreeMap::new(),
+                        output_side: None,
+                        label: None,
+                    },
+                    BatchPlaceEntry {
+                        position: GridPos { col: 1, row: 0 },
+                        piece_id: "strudel.fast".into(),
+                        inline_params: BTreeMap::new(),
+                        input_sides: BTreeMap::from([("pattern".into(), TileSide::LEFT)]),
+                        output_side: None,
+                        label: None,
+                    },
+                    BatchPlaceEntry {
+                        position: GridPos { col: 2, row: 0 },
+                        piece_id: "strudel.output".into(),
+                        inline_params: BTreeMap::new(),
+                        input_sides: BTreeMap::from([("pattern".into(), TileSide::LEFT)]),
+                        output_side: None,
+                        label: None,
+                    },
+                ],
+                edges: vec![],
+                auto_wire: true,
+            }],
+        )
+        .expect("batch auto-wire should succeed");
+
+        assert_eq!(graph.edges.len(), 2);
+        assert!(
+            graph.edges.values().any(|edge| {
+                edge.from == GridPos { col: 0, row: 0 }
+                    && edge.to_node == GridPos { col: 1, row: 0 }
+                    && edge.to_param == "pattern"
+            }),
+            "expected sound -> fast input edge"
+        );
+        assert!(
+            graph.edges.values().any(|edge| {
+                edge.from == GridPos { col: 1, row: 0 }
+                    && edge.to_node == GridPos { col: 2, row: 0 }
+                    && edge.to_param == "pattern"
+            }),
+            "expected fast -> output edge"
+        );
+        assert!(!outcome.undo_ops.is_empty());
     }
 }

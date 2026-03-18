@@ -23,7 +23,30 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::types::GridPos;
+use crate::types::{DomainBridgeKind, GridPos};
+
+// ---------------------------------------------------------------------------
+// Optimization level
+// ---------------------------------------------------------------------------
+
+/// Controls which optimization passes run on compiled expressions.
+///
+/// Higher levels include all passes from lower levels plus additional
+/// transformations.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum OptLevel {
+    /// No optimization — emit the AST exactly as pieces produce it.
+    None,
+    /// Constant folding + algebraic simplification (identity / absorbing
+    /// elements, double negation).
+    #[default]
+    Basic,
+    /// Basic + conditional simplification + common sub-expression elimination.
+    Full,
+}
 
 // ---------------------------------------------------------------------------
 // Source origin tracking
@@ -204,6 +227,41 @@ pub enum ExprKind {
     /// keys. Converting through JSON will normalize duplicates because JSON
     /// object parsing is map-based.
     Record { entries: Vec<(String, Expr)> },
+
+    /// A block of let-bindings followed by a result expression.
+    ///
+    /// Produced by the CSE (common sub-expression elimination) pass.
+    /// Backends render this as a sequence of local variable declarations
+    /// followed by the result value.
+    ///
+    /// ```text
+    /// // JS:   (() => { let _t0 = <value>; return <result>; })()
+    /// // Lua:  (function() local _t0 = <value>; return <result> end)()
+    /// ```
+    Block {
+        bindings: Vec<(String, Expr)>,
+        result: Box<Expr>,
+    },
+
+    /// A reference to a host-managed delay buffer (previous frame's value).
+    ///
+    /// Produced by the `core.delay` piece. The `slot` identifies which
+    /// frame buffer the host should read from; `default` provides the
+    /// initial value for frame 0 before any history exists.
+    ///
+    /// ```text
+    /// // JS:   __delay('d_3_2', <default>)
+    /// // Lua:  __delay('d_3_2', <default>)
+    /// ```
+    DelayRef { slot: String, default: Box<Expr> },
+
+    /// An implicit execution-domain bridge inserted by the compiler.
+    ///
+    /// Backends lower this to a host-provided runtime helper.
+    DomainConvert {
+        kind: DomainBridgeKind,
+        input: Box<Expr>,
+    },
 
     /// An error placeholder that replaces a missing or invalid expression.
     ///
@@ -400,6 +458,27 @@ impl Expr {
         Self::new(ExprKind::Record { entries })
     }
 
+    pub fn block(bindings: Vec<(String, Expr)>, result: Expr) -> Self {
+        Self::new(ExprKind::Block {
+            bindings,
+            result: Box::new(result),
+        })
+    }
+
+    pub fn delay_ref(slot: impl Into<String>, default: Expr) -> Self {
+        Self::new(ExprKind::DelayRef {
+            slot: slot.into(),
+            default: Box::new(default),
+        })
+    }
+
+    pub fn domain_convert(kind: DomainBridgeKind, expr: Expr) -> Self {
+        Self::new(ExprKind::DomainConvert {
+            kind,
+            input: Box::new(expr),
+        })
+    }
+
     pub fn error(message: impl Into<String>) -> Self {
         Self::new(ExprKind::Error {
             message: message.into(),
@@ -449,6 +528,78 @@ impl Expr {
         self.first_error().is_some()
     }
 
+    // -- Optimization passes ------------------------------------------------
+
+    /// Run optimization passes at the given level.
+    ///
+    /// - [`OptLevel::None`] — return a clone with no transformations.
+    /// - [`OptLevel::Basic`] — constant folding → algebraic simplification.
+    /// - [`OptLevel::Full`] — Basic + conditional simplification.
+    ///
+    /// CSE (common sub-expression elimination) is a *program-level* pass that
+    /// operates on terminal expression lists; see
+    /// [`Expr::hoist_common_subexprs`].
+    pub fn optimize_at(&self, level: OptLevel) -> Expr {
+        match level {
+            OptLevel::None => self.clone(),
+            OptLevel::Basic => self.fold_constants().eliminate_dead_code(),
+            OptLevel::Full => self
+                .fold_constants()
+                .eliminate_dead_code()
+                .simplify_conditionals(),
+        }
+    }
+
+    /// Run all canonical optimization passes in sequence
+    /// (equivalent to [`OptLevel::Basic`]).
+    pub fn optimize(&self) -> Expr {
+        self.optimize_at(OptLevel::Basic)
+    }
+
+    /// Constant-fold literal sub-expressions bottom-up.
+    ///
+    /// Evaluates arithmetic, comparison, logical, string-concat, conditional,
+    /// and unary operations when all operands are known literals.
+    pub fn fold_constants(&self) -> Expr {
+        opt::fold_expr(self)
+    }
+
+    /// Simplify by removing algebraic identity / absorbing elements and
+    /// collapsing double negation.
+    ///
+    /// **Identity elements** — return the other operand:
+    /// `x+0`, `0+x`, `x-0`, `x*1`, `1*x`, `x/1`, `x++""`, `""++x`,
+    /// `x&&true`, `true&&x`, `x||false`, `false||x`.
+    ///
+    /// **Absorbing elements** — short-circuit to a constant:
+    /// `x*0`, `0*x` → `0`; `x&&false` → `false`; `x||true` → `true`.
+    ///
+    /// **Double negation**: `!!x` → `x`, `--x` → `x`.
+    pub fn eliminate_dead_code(&self) -> Expr {
+        opt::dce_expr(self)
+    }
+
+    /// Simplify conditional expressions.
+    ///
+    /// - `cond ? x : x` → `x` (identical branches).
+    /// - Nested conditionals with matching branches are collapsed.
+    pub fn simplify_conditionals(&self) -> Expr {
+        opt::simplify_conditionals_expr(self)
+    }
+
+    /// Hoist common sub-expressions shared across a set of terminal
+    /// expressions into `Block` let-bindings.
+    ///
+    /// Returns a new list of expressions where duplicated sub-trees are
+    /// replaced by identifier references, with each terminal wrapped in a
+    /// `Block` that binds the shared values.
+    ///
+    /// This is a **program-level** pass — call it on the final terminal
+    /// expression list, not on individual per-node expressions.
+    pub fn hoist_common_subexprs(terminals: &[Expr]) -> Vec<Expr> {
+        opt::hoist_common_subexprs(terminals)
+    }
+
     /// Return the first nested `Error` node in a depth-first walk.
     pub fn first_error(&self) -> Option<&Expr> {
         match &self.kind {
@@ -477,9 +628,17 @@ impl Expr {
             ExprKind::Lambda { body, .. } => body.first_error(),
             ExprKind::Array { elements } => elements.iter().find_map(Expr::first_error),
             ExprKind::Record { entries } => entries.iter().find_map(|(_, v)| v.first_error()),
+            ExprKind::Block { bindings, result } => bindings
+                .iter()
+                .find_map(|(_, v)| v.first_error())
+                .or_else(|| result.first_error()),
+            ExprKind::DelayRef { default, .. } => default.first_error(),
+            ExprKind::DomainConvert { input, .. } => input.first_error(),
         }
     }
 }
+
+mod opt;
 
 #[cfg(test)]
 mod tests {
@@ -547,7 +706,7 @@ mod tests {
         assert_eq!(Expr::from_json_value(&json!(null)), Expr::nil());
         assert_eq!(Expr::from_json_value(&json!(true)), Expr::bool_lit(true));
         assert_eq!(Expr::from_json_value(&json!(42)), Expr::int(42));
-        assert_eq!(Expr::from_json_value(&json!(3.14)), Expr::float(3.14));
+        assert_eq!(Expr::from_json_value(&json!(2.5)), Expr::float(2.5));
         assert_eq!(
             Expr::from_json_value(&json!("hello")),
             Expr::str_lit("hello")
@@ -595,5 +754,394 @@ mod tests {
         assert_eq!(int_json, r#"{"kind":"int","value":42}"#);
         let int_lit: Lit = serde_json::from_str(&int_json).expect("deserialize int");
         assert_eq!(int_lit, Lit::Int(42));
+    }
+
+    // -- fold_constants tests -----------------------------------------------
+
+    fn test_origin() -> Origin {
+        Origin {
+            node: GridPos { col: 3, row: 2 },
+            param: Some("value".into()),
+        }
+    }
+
+    #[test]
+    fn folds_arithmetic_literals() {
+        assert_eq!(
+            Expr::bin_op(BinOp::Add, Expr::int(1), Expr::int(2)).fold_constants(),
+            Expr::int(3)
+        );
+        assert_eq!(
+            Expr::bin_op(BinOp::Add, Expr::float(1.0), Expr::int(2)).fold_constants(),
+            Expr::float(3.0)
+        );
+        assert_eq!(
+            Expr::bin_op(BinOp::Div, Expr::int(10), Expr::int(3)).fold_constants(),
+            Expr::float(10.0 / 3.0)
+        );
+        assert_eq!(
+            Expr::bin_op(BinOp::Div, Expr::int(9), Expr::int(3)).fold_constants(),
+            Expr::int(3)
+        );
+        assert_eq!(
+            Expr::bin_op(BinOp::Mod, Expr::int(7), Expr::int(3)).fold_constants(),
+            Expr::int(1)
+        );
+    }
+
+    #[test]
+    fn division_by_zero_stays_unchanged() {
+        let expr = Expr::bin_op(BinOp::Div, Expr::int(1), Expr::int(0));
+        assert_eq!(expr.fold_constants(), expr);
+    }
+
+    #[test]
+    fn folds_numeric_comparisons() {
+        assert_eq!(
+            Expr::bin_op(BinOp::Lt, Expr::int(1), Expr::int(2)).fold_constants(),
+            Expr::bool_lit(true)
+        );
+        assert_eq!(
+            Expr::bin_op(BinOp::Eq, Expr::float(3.0), Expr::int(3)).fold_constants(),
+            Expr::bool_lit(true)
+        );
+    }
+
+    #[test]
+    fn folds_logical_ops_and_short_circuits() {
+        assert_eq!(
+            Expr::bin_op(BinOp::And, Expr::bool_lit(true), Expr::bool_lit(false)).fold_constants(),
+            Expr::bool_lit(false)
+        );
+
+        let ident = Expr::ident("x");
+        assert_eq!(
+            Expr::bin_op(BinOp::And, Expr::bool_lit(true), ident.clone()).fold_constants(),
+            ident
+        );
+        assert_eq!(
+            Expr::bin_op(BinOp::Or, Expr::bool_lit(false), ident.clone()).fold_constants(),
+            ident
+        );
+    }
+
+    #[test]
+    fn folds_string_concat_to_default_syntax() {
+        let expr = Expr::bin_op(BinOp::Concat, Expr::pattern("a"), Expr::pattern("b"));
+        assert_eq!(
+            expr.fold_constants(),
+            Expr::new(ExprKind::Lit {
+                value: Lit::Str {
+                    value: "ab".into(),
+                    syntax: StringSyntax::Default,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn folds_unary_ops() {
+        assert_eq!(
+            Expr::unary_op(UnaryOp::Neg, Expr::int(5)).fold_constants(),
+            Expr::int(-5)
+        );
+        assert_eq!(
+            Expr::unary_op(UnaryOp::Not, Expr::bool_lit(true)).fold_constants(),
+            Expr::bool_lit(false)
+        );
+    }
+
+    #[test]
+    fn folds_conditionals() {
+        let expr = Expr::conditional(Expr::bool_lit(true), Expr::int(1), Expr::int(2));
+        assert_eq!(expr.fold_constants(), Expr::int(1));
+    }
+
+    #[test]
+    fn folds_nested_expressions_bottom_up() {
+        let expr = Expr::bin_op(
+            BinOp::Mul,
+            Expr::bin_op(BinOp::Add, Expr::int(1), Expr::int(2)),
+            Expr::int(3),
+        );
+        assert_eq!(expr.fold_constants(), Expr::int(9));
+    }
+
+    #[test]
+    fn leaves_non_foldable_expressions_alone() {
+        let expr = Expr::bin_op(BinOp::Add, Expr::ident("x"), Expr::int(1));
+        assert_eq!(expr.fold_constants(), expr);
+    }
+
+    #[test]
+    fn preserves_origin_for_literal_folds_and_child_rewrites() {
+        let origin = test_origin();
+        let folded = Expr::bin_op(BinOp::Add, Expr::int(1), Expr::int(2))
+            .with_origin(origin.clone())
+            .fold_constants();
+        assert_eq!(folded.origin, Some(origin.clone()));
+
+        let child_origin = Origin {
+            node: GridPos { col: 1, row: 1 },
+            param: None,
+        };
+        let logical = Expr::bin_op(
+            BinOp::And,
+            Expr::bool_lit(true),
+            Expr::ident("rhs").with_origin(child_origin.clone()),
+        )
+        .with_origin(origin.clone())
+        .fold_constants();
+        assert_eq!(logical.origin, Some(child_origin));
+
+        let conditional =
+            Expr::conditional(Expr::bool_lit(false), Expr::int(1), Expr::ident("fallback"))
+                .with_origin(origin.clone())
+                .fold_constants();
+        assert_eq!(conditional.origin, Some(origin));
+    }
+
+    // -- eliminate_dead_code tests ------------------------------------------
+
+    #[test]
+    fn dce_add_zero_identity() {
+        let x = Expr::ident("x");
+        assert_eq!(
+            Expr::bin_op(BinOp::Add, x.clone(), Expr::int(0)).eliminate_dead_code(),
+            x
+        );
+        assert_eq!(
+            Expr::bin_op(BinOp::Add, Expr::int(0), x.clone()).eliminate_dead_code(),
+            x
+        );
+        assert_eq!(
+            Expr::bin_op(BinOp::Add, x.clone(), Expr::float(0.0)).eliminate_dead_code(),
+            x
+        );
+    }
+
+    #[test]
+    fn dce_sub_zero_identity() {
+        let x = Expr::ident("x");
+        assert_eq!(
+            Expr::bin_op(BinOp::Sub, x.clone(), Expr::int(0)).eliminate_dead_code(),
+            x
+        );
+        let expr = Expr::bin_op(BinOp::Sub, Expr::int(0), x.clone());
+        assert_eq!(expr.eliminate_dead_code(), expr);
+    }
+
+    #[test]
+    fn dce_mul_one_identity() {
+        let x = Expr::ident("x");
+        assert_eq!(
+            Expr::bin_op(BinOp::Mul, x.clone(), Expr::int(1)).eliminate_dead_code(),
+            x
+        );
+        assert_eq!(
+            Expr::bin_op(BinOp::Mul, Expr::int(1), x.clone()).eliminate_dead_code(),
+            x
+        );
+        assert_eq!(
+            Expr::bin_op(BinOp::Mul, x.clone(), Expr::float(1.0)).eliminate_dead_code(),
+            x
+        );
+    }
+
+    #[test]
+    fn dce_div_one_identity() {
+        let x = Expr::ident("x");
+        assert_eq!(
+            Expr::bin_op(BinOp::Div, x.clone(), Expr::int(1)).eliminate_dead_code(),
+            x
+        );
+    }
+
+    #[test]
+    fn dce_mul_zero_absorbing() {
+        let x = Expr::ident("x");
+        assert_eq!(
+            Expr::bin_op(BinOp::Mul, x.clone(), Expr::int(0)).eliminate_dead_code(),
+            Expr::int(0)
+        );
+        assert_eq!(
+            Expr::bin_op(BinOp::Mul, Expr::int(0), x.clone()).eliminate_dead_code(),
+            Expr::int(0)
+        );
+    }
+
+    #[test]
+    fn dce_concat_empty_identity() {
+        let x = Expr::ident("x");
+        assert_eq!(
+            Expr::bin_op(BinOp::Concat, x.clone(), Expr::str_lit("")).eliminate_dead_code(),
+            x
+        );
+        assert_eq!(
+            Expr::bin_op(BinOp::Concat, Expr::str_lit(""), x.clone()).eliminate_dead_code(),
+            x
+        );
+    }
+
+    #[test]
+    fn dce_and_identity_and_absorbing() {
+        let x = Expr::ident("x");
+        assert_eq!(
+            Expr::bin_op(BinOp::And, x.clone(), Expr::bool_lit(true)).eliminate_dead_code(),
+            x
+        );
+        assert_eq!(
+            Expr::bin_op(BinOp::And, Expr::bool_lit(true), x.clone()).eliminate_dead_code(),
+            x
+        );
+        assert_eq!(
+            Expr::bin_op(BinOp::And, x.clone(), Expr::bool_lit(false)).eliminate_dead_code(),
+            Expr::bool_lit(false)
+        );
+    }
+
+    #[test]
+    fn dce_or_identity_and_absorbing() {
+        let x = Expr::ident("x");
+        assert_eq!(
+            Expr::bin_op(BinOp::Or, x.clone(), Expr::bool_lit(false)).eliminate_dead_code(),
+            x
+        );
+        assert_eq!(
+            Expr::bin_op(BinOp::Or, Expr::bool_lit(false), x.clone()).eliminate_dead_code(),
+            x
+        );
+        assert_eq!(
+            Expr::bin_op(BinOp::Or, x.clone(), Expr::bool_lit(true)).eliminate_dead_code(),
+            Expr::bool_lit(true)
+        );
+    }
+
+    #[test]
+    fn dce_double_not() {
+        let x = Expr::ident("x");
+        assert_eq!(
+            Expr::unary_op(UnaryOp::Not, Expr::unary_op(UnaryOp::Not, x.clone()))
+                .eliminate_dead_code(),
+            x
+        );
+    }
+
+    #[test]
+    fn dce_double_neg() {
+        let x = Expr::ident("x");
+        assert_eq!(
+            Expr::unary_op(UnaryOp::Neg, Expr::unary_op(UnaryOp::Neg, x.clone()))
+                .eliminate_dead_code(),
+            x
+        );
+    }
+
+    #[test]
+    fn dce_mismatched_double_unary_not_simplified() {
+        let x = Expr::ident("x");
+        let expr = Expr::unary_op(UnaryOp::Neg, Expr::unary_op(UnaryOp::Not, x));
+        assert_eq!(expr.eliminate_dead_code(), expr);
+    }
+
+    #[test]
+    fn dce_leaves_non_simplifiable_alone() {
+        let expr = Expr::bin_op(BinOp::Add, Expr::ident("x"), Expr::ident("y"));
+        assert_eq!(expr.eliminate_dead_code(), expr);
+
+        let expr = Expr::bin_op(BinOp::Mul, Expr::ident("x"), Expr::int(2));
+        assert_eq!(expr.eliminate_dead_code(), expr);
+    }
+
+    #[test]
+    fn dce_nested_bottom_up() {
+        let x = Expr::ident("x");
+        let expr = Expr::bin_op(
+            BinOp::Add,
+            Expr::bin_op(BinOp::Mul, x.clone(), Expr::int(1)),
+            Expr::int(0),
+        );
+        assert_eq!(expr.eliminate_dead_code(), x);
+    }
+
+    #[test]
+    fn dce_preserves_origins() {
+        let origin = test_origin();
+        let child_origin = Origin {
+            node: GridPos { col: 1, row: 1 },
+            param: None,
+        };
+
+        let x = Expr::ident("x");
+        let result = Expr::bin_op(BinOp::Add, x.clone(), Expr::int(0))
+            .with_origin(origin.clone())
+            .eliminate_dead_code();
+        assert_eq!(result, x.clone().with_origin(origin.clone()));
+
+        let result = Expr::bin_op(
+            BinOp::Add,
+            x.clone().with_origin(child_origin.clone()),
+            Expr::int(0),
+        )
+        .with_origin(origin.clone())
+        .eliminate_dead_code();
+        assert_eq!(result.origin, Some(child_origin));
+
+        let result = Expr::bin_op(BinOp::Mul, x.clone(), Expr::int(0))
+            .with_origin(origin.clone())
+            .eliminate_dead_code();
+        assert_eq!(result, Expr::int(0).with_origin(origin));
+    }
+
+    // -- optimize (combined pass) -------------------------------------------
+
+    #[test]
+    fn optimize_chains_fold_then_dce() {
+        // fold: 1+2 → 3, then dce: x * 1 → x won't apply (3 is not 1)
+        // but: fold: true → true, then dce: x && true → x does chain
+        let x = Expr::ident("x");
+        let expr = Expr::bin_op(
+            BinOp::And,
+            x.clone(),
+            Expr::bin_op(BinOp::Eq, Expr::int(1), Expr::int(1)),
+        );
+        assert_eq!(expr.optimize(), x);
+    }
+
+    #[test]
+    fn full_opt_simplifies_matching_conditional_branches() {
+        let expr = Expr::conditional(
+            Expr::ident("cond"),
+            Expr::method_call(Expr::ident("x"), "fast", Vec::new()),
+            Expr::method_call(Expr::ident("x"), "fast", Vec::new()),
+        );
+
+        assert_eq!(
+            expr.optimize_at(OptLevel::Full),
+            Expr::method_call(Expr::ident("x"), "fast", Vec::new())
+        );
+    }
+
+    #[test]
+    fn cse_hoists_common_subexpressions_without_self_references() {
+        let terminals = vec![
+            Expr::method_call(Expr::str_lit("bd"), "fast", Vec::new()),
+            Expr::method_call(Expr::str_lit("bd"), "fast", Vec::new()),
+        ];
+
+        let hoisted = Expr::hoist_common_subexprs(&terminals);
+        assert_eq!(hoisted.len(), 2);
+
+        for expr in hoisted {
+            match expr.kind {
+                ExprKind::Block { bindings, result } => {
+                    assert_eq!(bindings.len(), 1);
+                    assert_eq!(bindings[0].0, "_t0");
+                    assert_eq!(*result, Expr::ident("_t0"));
+                    assert_ne!(bindings[0].1, Expr::ident("_t0"));
+                }
+                other => panic!("expected hoisted block, got {other:?}"),
+            }
+        }
     }
 }

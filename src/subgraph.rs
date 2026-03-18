@@ -11,8 +11,10 @@ use crate::piece::{
     ParamDef, ParamInlineMode, ParamSchema, ParamValueKind, Piece, PieceDef, PieceInputs,
 };
 use crate::piece_registry::PieceRegistry;
-use crate::semantic::semantic_pass;
-use crate::types::{GridPos, PieceCategory, PieceSemanticKind, PortType, TileSide};
+use crate::semantic::{resolved_input_types_for_piece, semantic_pass};
+use crate::types::{
+    ExecutionDomain, GridPos, PieceCategory, PieceSemanticKind, PortType, TileSide,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -69,10 +71,12 @@ impl SubgraphInput {
 }
 
 /// Signature extracted from a subgraph after analysis.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubgraphSignature {
     pub inputs: Vec<SubgraphInput>,
     pub output_pos: GridPos,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_type: Option<PortType>,
 }
 
 /// A fully compiled subgraph ready to be used as a piece.
@@ -93,6 +97,7 @@ impl CompiledSubgraph {
             &self.display_name,
             &self.binding_name,
             &self.signature.inputs,
+            self.signature.output_type.clone(),
         )
     }
 }
@@ -148,6 +153,24 @@ impl SubgraphInputPiece {
                         required: false,
                     },
                     ParamDef {
+                        id: "domain".into(),
+                        label: "domain".into(),
+                        side: TileSide::BOTTOM,
+                        schema: ParamSchema::Enum {
+                            options: vec![
+                                "control".into(),
+                                "audio".into(),
+                                "event".into(),
+                                "unspecified".into(),
+                            ],
+                            default: "control".into(),
+                            can_inline: true,
+                        },
+                        text_semantics: Default::default(),
+                        variadic_group: None,
+                        required: false,
+                    },
+                    ParamDef {
                         id: "required".into(),
                         label: "required".into(),
                         side: TileSide::BOTTOM,
@@ -176,7 +199,7 @@ impl SubgraphInputPiece {
                         label: "default".into(),
                         side: TileSide::BOTTOM,
                         schema: ParamSchema::Custom {
-                            port_type: PortType::any(),
+                            port_type: PortType::any().with_unspecified_domain(),
                             value_kind: ParamValueKind::Json,
                             default: None,
                             can_inline: true,
@@ -189,13 +212,14 @@ impl SubgraphInputPiece {
                         required: false,
                     },
                 ],
-                output_type: Some(PortType::any()),
+                output_type: Some(PortType::any().with_unspecified_domain()),
                 output_side: Some(TileSide::RIGHT),
                 description: Some(
                     "Subgraph boundary input. Configure its metadata via inline params; \
                      used as a formal parameter when compiling the subgraph."
                         .into(),
                 ),
+                tags: vec!["subgraph".into(), "boundary".into()],
             },
             slot,
         }
@@ -210,11 +234,25 @@ impl Piece for SubgraphInputPiece {
     fn compile(&self, _inputs: &PieceInputs, _inline_params: &BTreeMap<String, Value>) -> Expr {
         Expr::ident(format!("arg{}", self.slot))
     }
+
+    fn infer_output_type(
+        &self,
+        _input_types: &BTreeMap<String, PortType>,
+        inline_params: &BTreeMap<String, Value>,
+    ) -> Option<PortType> {
+        Some(subgraph_boundary_port_type(inline_params))
+    }
 }
 
 /// A subgraph boundary output piece.
 pub struct SubgraphOutputPiece {
     def: PieceDef,
+}
+
+impl Default for SubgraphOutputPiece {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SubgraphOutputPiece {
@@ -231,7 +269,7 @@ impl SubgraphOutputPiece {
                     label: "input".into(),
                     side: TileSide::LEFT,
                     schema: ParamSchema::Custom {
-                        port_type: PortType::any(),
+                        port_type: PortType::any().with_unspecified_domain(),
                         value_kind: ParamValueKind::None,
                         default: None,
                         can_inline: false,
@@ -249,6 +287,7 @@ impl SubgraphOutputPiece {
                     "Subgraph boundary output. Connect the expression this subgraph should return."
                         .into(),
                 ),
+                tags: vec!["subgraph".into(), "boundary".into()],
             },
         }
     }
@@ -284,6 +323,7 @@ impl GeneratedSubgraphPiece {
         label: &str,
         binding_name: &str,
         ordered_inputs: &[SubgraphInput],
+        output_type: Option<PortType>,
     ) -> Self {
         let params = build_generated_params(ordered_inputs);
         Self {
@@ -294,9 +334,12 @@ impl GeneratedSubgraphPiece {
                 semantic_kind: PieceSemanticKind::Trick,
                 namespace: "user".into(),
                 params,
-                output_type: Some(PortType::any()),
+                output_type: output_type
+                    .clone()
+                    .or_else(|| Some(PortType::any().with_unspecified_domain())),
                 output_side: Some(TileSide::RIGHT),
                 description: Some("User-defined subgraph macro.".into()),
+                tags: vec!["subgraph".into()],
             },
             binding_name: binding_name.to_lowercase(),
             ordered_inputs: ordered_inputs.to_vec(),
@@ -321,31 +364,31 @@ impl Piece for GeneratedSubgraphPiece {
             .collect();
 
         let receiver = resolved.iter().find(|r| r.input.is_receiver);
-        if let Some(receiver) = receiver {
-            if receiver.expr.is_none() {
-                let has_explicit_partial = resolved
-                    .iter()
-                    .any(|r| !r.input.is_receiver && r.is_explicit);
-                if !has_explicit_partial {
-                    return Expr::ident(self.binding_name.clone());
-                }
-                // Build a structural lambda for partial application.
-                let placeholder = "pattern";
-                let lambda_args: Vec<Expr> = resolved
-                    .iter()
-                    .map(|r| {
-                        if r.input.is_receiver {
-                            Expr::ident(placeholder)
-                        } else {
-                            r.expr.clone().unwrap_or_else(Expr::nil)
-                        }
-                    })
-                    .collect();
-                return Expr::lambda(
-                    vec![placeholder.into()],
-                    Expr::call_named(&self.binding_name, lambda_args),
-                );
+        if let Some(receiver) = receiver
+            && receiver.expr.is_none()
+        {
+            let has_explicit_partial = resolved
+                .iter()
+                .any(|r| !r.input.is_receiver && r.is_explicit);
+            if !has_explicit_partial {
+                return Expr::ident(self.binding_name.clone());
             }
+            // Build a structural lambda for partial application.
+            let placeholder = "pattern";
+            let lambda_args: Vec<Expr> = resolved
+                .iter()
+                .map(|r| {
+                    if r.input.is_receiver {
+                        Expr::ident(placeholder)
+                    } else {
+                        r.expr.clone().unwrap_or_else(Expr::nil)
+                    }
+                })
+                .collect();
+            return Expr::lambda(
+                vec![placeholder.into()],
+                Expr::call_named(&self.binding_name, lambda_args),
+            );
         }
 
         Expr::call_named(
@@ -369,6 +412,7 @@ pub fn analyze_subgraph(
     graph: &Graph,
     registry: &PieceRegistry,
 ) -> Result<SubgraphSignature, Vec<Diagnostic>> {
+    let sem = semantic_pass(graph, registry);
     let mut inputs = Vec::<SubgraphInput>::new();
     let mut output_positions = Vec::<GridPos>::new();
     let mut diagnostics = Vec::<Diagnostic>::new();
@@ -382,12 +426,7 @@ pub fn analyze_subgraph(
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| format!("input {slot}"));
-            let port_type = node
-                .inline_params
-                .get("port_type")
-                .and_then(Value::as_str)
-                .map(PortType::from)
-                .unwrap_or_else(PortType::any);
+            let port_type = subgraph_boundary_port_type(&node.inline_params);
             let required = node
                 .inline_params
                 .get("required")
@@ -402,7 +441,7 @@ pub fn analyze_subgraph(
 
             inputs.push(SubgraphInput {
                 slot,
-                pos: pos.clone(),
+                pos: *pos,
                 label,
                 port_type,
                 required,
@@ -410,7 +449,7 @@ pub fn analyze_subgraph(
                 default_value,
             });
         } else if node.piece_id == SUBGRAPH_OUTPUT_ID {
-            output_positions.push(pos.clone());
+            output_positions.push(*pos);
         }
     }
 
@@ -419,7 +458,7 @@ pub fn analyze_subgraph(
             DiagnosticKind::InvalidOperation {
                 reason: format!("subgraph may declare at most {MAX_SUBGRAPH_INPUTS} inputs"),
             },
-            inputs.get(MAX_SUBGRAPH_INPUTS).map(|i| i.pos.clone()),
+            inputs.get(MAX_SUBGRAPH_INPUTS).map(|i| i.pos),
         ));
     }
 
@@ -430,7 +469,7 @@ pub fn analyze_subgraph(
                 DiagnosticKind::InvalidOperation {
                     reason: format!("duplicate subgraph input slot {}", input.slot),
                 },
-                Some(input.pos.clone()),
+                Some(input.pos),
             ));
         }
     }
@@ -457,7 +496,7 @@ pub fn analyze_subgraph(
             DiagnosticKind::InvalidOperation {
                 reason: "subgraph may declare at most one receiver input".into(),
             },
-            inputs.iter().find(|i| i.is_receiver).map(|i| i.pos.clone()),
+            inputs.iter().find(|i| i.is_receiver).map(|i| i.pos),
         ));
     }
 
@@ -478,18 +517,37 @@ pub fn analyze_subgraph(
             else {
                 continue;
             };
-            if !param_def.schema.accepts(&input.port_type) {
-                diagnostics.push(
-                    Diagnostic::error(
-                        DiagnosticKind::TypeMismatch {
-                            expected: param_def.schema.expected_port_type(),
-                            got: input.port_type.clone(),
-                            param: edge.to_param.clone(),
-                        },
-                        Some(edge.to_node.clone()),
-                    )
-                    .with_edge(edge.id.clone()),
-                );
+            match param_def.schema.resolve_connection(&input.port_type) {
+                Ok(_) => {}
+                Err(crate::types::PortTypeConnectionError::ValueMismatch { expected, got }) => {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            DiagnosticKind::TypeMismatch {
+                                expected,
+                                got,
+                                param: edge.to_param.clone(),
+                            },
+                            Some(edge.to_node),
+                        )
+                        .with_edge(edge.id.clone()),
+                    );
+                }
+                Err(crate::types::PortTypeConnectionError::UnsupportedDomain {
+                    expected,
+                    got,
+                }) => {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            DiagnosticKind::UnsupportedDomainCrossing {
+                                expected,
+                                got,
+                                param: edge.to_param.clone(),
+                            },
+                            Some(edge.to_node),
+                        )
+                        .with_edge(edge.id.clone()),
+                    );
+                }
             }
         }
     }
@@ -499,12 +557,31 @@ pub fn analyze_subgraph(
     }
 
     inputs.sort_by_key(|i| i.slot);
+    let output_pos = output_positions
+        .into_iter()
+        .next()
+        .expect("checked output existence");
+    let output_type = graph
+        .nodes
+        .get(&output_pos)
+        .and_then(|output_node| {
+            registry
+                .get(output_node.piece_id.as_str())
+                .map(|output_piece| {
+                    resolved_input_types_for_piece(
+                        graph,
+                        output_node,
+                        &output_pos,
+                        output_piece.def(),
+                        &sem.output_types,
+                    )
+                })
+        })
+        .and_then(|input_types| input_types.get("input").cloned());
     Ok(SubgraphSignature {
         inputs,
-        output_pos: output_positions
-            .into_iter()
-            .next()
-            .expect("checked output existence"),
+        output_pos,
+        output_type,
     })
 }
 
@@ -535,9 +612,9 @@ pub fn compile_subgraph(
     let mut overrides = BTreeMap::new();
     for input in &signature.inputs {
         overrides.insert(
-            input.pos.clone(),
+            input.pos,
             Expr::ident(input.param_name()).with_origin(Origin {
-                node: input.pos.clone(),
+                node: input.pos,
                 param: Some(format!("arg{}", input.slot)),
             }),
         );
@@ -596,9 +673,9 @@ pub fn compile_subgraphs(
         let mut overrides = BTreeMap::new();
         for input in &signature.inputs {
             overrides.insert(
-                input.pos.clone(),
+                input.pos,
                 Expr::ident(input.param_name()).with_origin(Origin {
-                    node: input.pos.clone(),
+                    node: input.pos,
                     param: Some(format!("arg{}", input.slot)),
                 }),
             );
@@ -658,13 +735,12 @@ pub fn subgraph_editor_pieces() -> Vec<Box<dyn Piece>> {
 fn build_generated_params(inputs: &[SubgraphInput]) -> Vec<ParamDef> {
     let mut ordered = inputs.to_vec();
     ordered.sort_by_key(|i| (if i.is_receiver { 0 } else { 1 }, i.slot));
+    let has_receiver = ordered.iter().any(|input| input.is_receiver);
     let mut extra_sides = vec![TileSide::BOTTOM, TileSide::TOP, TileSide::RIGHT];
     let mut params = Vec::with_capacity(ordered.len());
 
     for (index, input) in ordered.iter().enumerate() {
-        let side = if input.is_receiver {
-            TileSide::LEFT
-        } else if !ordered.iter().any(|v| v.is_receiver) && index == 0 {
+        let side = if input.is_receiver || (!has_receiver && index == 0) {
             TileSide::LEFT
         } else {
             extra_sides.remove(0.min(extra_sides.len().saturating_sub(1)))
@@ -688,37 +764,77 @@ fn build_generated_params(inputs: &[SubgraphInput]) -> Vec<ParamDef> {
 }
 
 fn schema_for_port(port_type: &PortType, default: Option<Value>, can_inline: bool) -> ParamSchema {
-    match port_type.as_str() {
-        "number" => ParamSchema::Number {
-            default: default.and_then(|v| v.as_f64()).unwrap_or(0.0),
-            min: None,
-            max: None,
-            can_inline,
-        },
-        "text" => ParamSchema::Text {
-            default: default
-                .and_then(|v| v.as_str().map(String::from))
-                .unwrap_or_default(),
-            can_inline,
-        },
-        "bool" => ParamSchema::Bool {
-            default: default.and_then(|v| v.as_bool()).unwrap_or(false),
-            can_inline,
-        },
-        _ => ParamSchema::Custom {
-            port_type: port_type.clone(),
-            value_kind: ParamValueKind::Json,
-            default,
-            can_inline,
-            inline_mode: ParamInlineMode::Literal,
-            min: None,
-            max: None,
-        },
+    if port_type.domain() == Some(ExecutionDomain::Control) {
+        match port_type.as_str() {
+            "number" => {
+                return ParamSchema::Number {
+                    default: default.and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    min: None,
+                    max: None,
+                    can_inline,
+                };
+            }
+            "text" => {
+                return ParamSchema::Text {
+                    default: default
+                        .and_then(|v| v.as_str().map(String::from))
+                        .unwrap_or_default(),
+                    can_inline,
+                };
+            }
+            "bool" => {
+                return ParamSchema::Bool {
+                    default: default.and_then(|v| v.as_bool()).unwrap_or(false),
+                    can_inline,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    ParamSchema::Custom {
+        port_type: port_type.clone(),
+        value_kind: value_kind_for_port(port_type),
+        default,
+        can_inline,
+        inline_mode: ParamInlineMode::Literal,
+        min: None,
+        max: None,
     }
 }
 
 fn can_inline_for_port(port_type: &PortType) -> bool {
     matches!(port_type.as_str(), "number" | "text" | "bool")
+}
+
+fn value_kind_for_port(port_type: &PortType) -> ParamValueKind {
+    match port_type.as_str() {
+        "number" => ParamValueKind::Number,
+        "text" => ParamValueKind::Text,
+        "bool" => ParamValueKind::Bool,
+        _ => ParamValueKind::Json,
+    }
+}
+
+fn subgraph_boundary_port_type(inline_params: &BTreeMap<String, Value>) -> PortType {
+    let kind = inline_params
+        .get("port_type")
+        .and_then(Value::as_str)
+        .unwrap_or("any");
+    match subgraph_boundary_domain(inline_params) {
+        Some(domain) => PortType::from(kind).with_domain(domain),
+        None => PortType::from(kind).with_unspecified_domain(),
+    }
+}
+
+fn subgraph_boundary_domain(inline_params: &BTreeMap<String, Value>) -> Option<ExecutionDomain> {
+    match inline_params.get("domain").and_then(Value::as_str) {
+        Some("audio") => Some(ExecutionDomain::Audio),
+        Some("event") => Some(ExecutionDomain::Event),
+        Some("unspecified") => None,
+        Some("control") | None => Some(ExecutionDomain::Control),
+        Some(_) => Some(ExecutionDomain::Control),
+    }
 }
 
 pub fn default_expr_for_input(input: &SubgraphInput) -> Option<Expr> {
@@ -730,7 +846,7 @@ pub fn default_expr_for_input(input: &SubgraphInput) -> Option<Expr> {
     .default_expr()
     .map(|expr| {
         expr.with_origin_if_missing(Origin {
-            node: input.pos.clone(),
+            node: input.pos,
             param: Some(format!("arg{}", input.slot)),
         })
     })
@@ -846,9 +962,23 @@ mod tests {
     use crate::ast::ExprKind;
     use crate::backend::{Backend, JsBackend};
     use crate::graph::{Edge, Node};
-    use crate::types::EdgeId;
+    use crate::types::{EdgeId, ExecutionDomain};
 
     fn make_input(slot: u8, port_type: &str, required: bool, is_receiver: bool) -> SubgraphInput {
+        make_typed_input(
+            slot,
+            PortType::from(port_type),
+            required,
+            is_receiver,
+        )
+    }
+
+    fn make_typed_input(
+        slot: u8,
+        port_type: PortType,
+        required: bool,
+        is_receiver: bool,
+    ) -> SubgraphInput {
         SubgraphInput {
             slot,
             pos: GridPos {
@@ -856,7 +986,7 @@ mod tests {
                 row: 0,
             },
             label: format!("arg{slot}"),
-            port_type: PortType::from(port_type),
+            port_type,
             required,
             is_receiver,
             default_value: None,
@@ -870,6 +1000,25 @@ mod tests {
         let piece = SubgraphInputPiece::new(2);
         let expr = piece.compile(&PieceInputs::default(), &BTreeMap::new());
         assert_eq!(JsBackend.render(&expr), "arg2");
+    }
+
+    #[test]
+    fn input_piece_infers_port_type_with_domain_from_inline_metadata() {
+        let piece = SubgraphInputPiece::new(1);
+        let inferred = piece
+            .infer_output_type(
+                &BTreeMap::new(),
+                &BTreeMap::from([
+                    ("port_type".into(), Value::String("number".into())),
+                    ("domain".into(), Value::String("audio".into())),
+                ]),
+            )
+            .expect("subgraph input output type");
+
+        assert_eq!(
+            inferred,
+            PortType::number().with_domain(ExecutionDomain::Audio)
+        );
     }
 
     #[test]
@@ -893,23 +1042,33 @@ mod tests {
 
     #[test]
     fn zero_input_compiles_to_ident() {
-        let piece = GeneratedSubgraphPiece::new("my_sub", "my sub", "my_sub", &[]);
+        let piece = GeneratedSubgraphPiece::new("my_sub", "my sub", "my_sub", &[], None);
         let expr = piece.compile(&PieceInputs::default(), &BTreeMap::new());
         assert_eq!(JsBackend.render(&expr), "my_sub");
     }
 
     #[test]
     fn receiver_not_connected_compiles_to_ident() {
-        let piece =
-            GeneratedSubgraphPiece::new("fx", "fx", "fx", &[make_input(1, "any", true, true)]);
+        let piece = GeneratedSubgraphPiece::new(
+            "fx",
+            "fx",
+            "fx",
+            &[make_input(1, "any", true, true)],
+            None,
+        );
         let expr = piece.compile(&PieceInputs::default(), &BTreeMap::new());
         assert_eq!(JsBackend.render(&expr), "fx");
     }
 
     #[test]
     fn receiver_connected_compiles_to_call() {
-        let piece =
-            GeneratedSubgraphPiece::new("fx", "fx", "fx", &[make_input(1, "any", true, true)]);
+        let piece = GeneratedSubgraphPiece::new(
+            "fx",
+            "fx",
+            "fx",
+            &[make_input(1, "any", true, true)],
+            None,
+        );
         let mut inputs = PieceInputs::default();
         inputs.scalar.insert("arg1".into(), Expr::ident("src"));
         let expr = piece.compile(&inputs, &BTreeMap::new());
@@ -927,6 +1086,7 @@ mod tests {
                 make_input(1, "any", true, true),
                 make_input(2, "number", false, false),
             ],
+            None,
         );
         let mut inputs = PieceInputs::default();
         inputs.scalar.insert("arg2".into(), Expr::float(0.5));
@@ -942,6 +1102,24 @@ mod tests {
     fn strip_trailing_none_replaces_internal_gaps_with_nil() {
         let args = strip_trailing_none(vec![Some(Expr::ident("src")), None, Some(Expr::int(2))]);
         assert_eq!(args, vec![Expr::ident("src"), Expr::nil(), Expr::int(2)]);
+    }
+
+    #[test]
+    fn generated_piece_preserves_audio_number_schema_and_output_type() {
+        let audio_number = PortType::number().with_domain(ExecutionDomain::Audio);
+        let piece = GeneratedSubgraphPiece::new(
+            "fx",
+            "fx",
+            "fx",
+            &[make_typed_input(1, audio_number.clone(), true, false)],
+            Some(audio_number.clone()),
+        );
+
+        assert_eq!(piece.def().output_type, Some(audio_number.clone()));
+        match &piece.def().params[0].schema {
+            ParamSchema::Custom { port_type, .. } => assert_eq!(port_type, &audio_number),
+            other => panic!("expected custom schema to preserve domain, got {other:?}"),
+        }
     }
 
     // -- analyze_subgraph --
@@ -989,6 +1167,7 @@ mod tests {
                     output_type: Some(PortType::any()),
                     output_side: Some(TileSide::RIGHT),
                     description: None,
+                    tags: vec![],
                 },
             }
         }
@@ -1019,7 +1198,7 @@ mod tests {
         let graph = Graph {
             nodes: BTreeMap::from([
                 (
-                    input_pos.clone(),
+                    input_pos,
                     Node {
                         piece_id: SUBGRAPH_INPUT_1_ID.into(),
                         inline_params: BTreeMap::from([(
@@ -1033,7 +1212,7 @@ mod tests {
                     },
                 ),
                 (
-                    xform_pos.clone(),
+                    xform_pos,
                     Node {
                         piece_id: "test.transform".into(),
                         inline_params: BTreeMap::new(),
@@ -1044,7 +1223,7 @@ mod tests {
                     },
                 ),
                 (
-                    output_pos.clone(),
+                    output_pos,
                     Node {
                         piece_id: SUBGRAPH_OUTPUT_ID.into(),
                         inline_params: BTreeMap::new(),
@@ -1061,7 +1240,7 @@ mod tests {
                     Edge {
                         id: edge_a_id,
                         from: input_pos,
-                        to_node: xform_pos.clone(),
+                        to_node: xform_pos,
                         to_param: "input".into(),
                     },
                 ),
@@ -1090,6 +1269,7 @@ mod tests {
         assert_eq!(sig.inputs[0].slot, 1);
         assert_eq!(sig.inputs[0].label, "src");
         assert_eq!(sig.output_pos, GridPos { col: 2, row: 0 });
+        assert_eq!(sig.output_type, Some(PortType::any()));
     }
 
     #[test]
@@ -1102,5 +1282,6 @@ mod tests {
         };
         let compiled = compile_subgraph(&def, &reg).expect("compile");
         assert_eq!(JsBackend.render(&compiled.body), "src.xform()");
+        assert_eq!(compiled.signature.output_type, Some(PortType::any()));
     }
 }
