@@ -1,27 +1,40 @@
 # Tessera
 
-Tessera is a host-agnostic typed graph engine for visual music and visual programming editors. It gives a host application the core pieces needed to describe a grid-based graph, validate it, compile it into a language-neutral expression AST, and then render that AST into a target language such as JavaScript or Lua.
+Tessera is a graph-analysis kernel for tile-based editors.
 
-This repository currently contains the engine crate, not a standalone editor application. The crate is also not published to crates.io yet (`publish = false` in `Cargo.toml`), so the normal way to adopt it today is as a workspace member or a local path dependency.
+A host application defines pieces, users arrange them on a grid, and Tessera
+turns that editable graph into stable semantic facts:
 
-## What Tessera Is
+- which nodes are explicit output roots
+- which source feeds each input
+- which effective types were inferred
+- where domain bridges are needed
+- which edges behave like delay feedback
+- what subgraph boundaries expose to the host
 
-Tessera is designed for hosts that want a reusable graph core without baking target-language rules, UI policies, or domain-specific pieces into the engine itself.
+The host crate then walks those facts and lowers them into its own
+representation.
 
-The main pipeline looks like this:
+## What Tessera Owns
 
-1. A host defines a set of `Piece`s and registers them in a `PieceRegistry`.
-2. The host or editor stores user work as a `Graph` made of typed nodes and edges.
-3. Tessera runs semantic analysis to detect structural, typing, wiring, and reachability problems.
-4. Tessera compiles the graph into a neutral `Expr` AST with graph-origin metadata.
-5. A backend renders those expressions into target output such as JavaScript or Lua.
-6. The host decides how to run, persist, display, animate, and react to the compiled result.
+- Graph structure and mutation ops
+- Piece catalogs and graph typing rules
+- Validation and deterministic semantic analysis
+- Connection probing and repair hints
+- Subgraph boundary analysis
 
-That separation is the key design rule in this crate: Tessera owns the graph engine and shared IR, while host code owns domain behavior.
+## What The Host Owns
 
-## Getting Started
+- Project documents and persistence
+- Domain-specific piece meaning
+- Lowering from `AnalyzedGraph` into the app's own representation
+- Execution policy and scheduling
+- Preview, probe, and activity/telemetry representations
+- External resources and side effects
 
-Because the crate is not published yet, use it from the local workspace or via a path dependency:
+## Quick Start
+
+Add Tessera as a dependency:
 
 ```toml
 [dependencies]
@@ -29,678 +42,120 @@ tessera = { path = "../tessera" }
 serde_json = "1"
 ```
 
-If you are building a host application, you will typically:
-
-- Define one or more `Piece` implementations for your domain.
-- Register those pieces in a `PieceRegistry`.
-- Implement `HostAdapter` to provide the registry and, optionally, a backend override.
-- Store editor state as `Graph` or `ProjectDocument`.
-- Use `GraphEngine` for analysis, compilation, graph ops, and runtime snapshot shaping.
-
-## Current Features
-
-- Typed grid graphs with `Graph`, `Node`, `Edge`, bounds (`cols` and `rows`), labels, and optional per-node opaque state.
-- A flexible piece model with `Piece`, `PieceDef`, `ParamDef`, and `ParamSchema`.
-- Inline parameter values, compile-time defaults, per-param side assignment, output-side overrides, and variadic fan-in groups.
-- Preview timelines and stateful compilation hooks for pieces that need animation hints or persisted state.
-- Semantic diagnostics for unknown pieces and params, missing required params, duplicate connections, type mismatches, side mismatches, non-adjacent wiring, cycles, missing terminals, multiple terminals, and unreachable nodes.
-- Two compile modes: `Preview` and `Runtime`.
-- A language-neutral `Expr` AST with origin tracking back to graph nodes and params.
-- Built-in backends for JavaScript (`JsBackend`) and Lua 5.3+ (`LuaBackend`).
-- Graph mutation helpers for placement, movement, swapping, removal, resizing, inline param changes, side changes, labels, node state, and explicit edge operations.
-- Atomic batch placement with optional explicit edges and adjacency-based auto-wiring.
-- Edge probing helpers that return machine-readable rejection reasons plus repair suggestions.
-- Subgraph boundary pieces, subgraph analysis, compiled subgraph metadata, and generated subgraph pieces.
-- Runtime activity and probe snapshot types for UI feedback surfaces.
-- Small optimization helpers including constant folding, dead-code elimination, and backward reachability analysis.
-- Serde support across the core graph, diagnostics, AST, activity, and project document types.
-
-## Core Concepts
-
-| Type | What it means |
-| --- | --- |
-| `Graph` | A rectangular workspace containing nodes and edges. |
-| `Node` | One placed piece instance on the grid, including inline params, side assignments, label, and optional node state. |
-| `Edge` | A directed connection from one node output to a specific target parameter on another node. |
-| `Piece` | The trait every placeable node type implements. It defines metadata plus compile behavior. |
-| `PieceDef` | Static description of a piece: id, label, category, params, output type, namespace, tags, and more. |
-| `PieceRegistry` | Lookup table for all pieces available to a host. |
-| `HostAdapter` | Host-specific integration point for registry creation, backend selection, terminal rendering, state persistence, and runtime snapshot shaping. |
-| `GraphEngine` | Convenience wrapper around analysis, compilation, graph ops, preview timelines, and runtime snapshots. |
-| `CompileProgram` | Output of a successful compile: terminal expressions, node state updates, and activity events. |
-| `GraphOp` | Canonical mutation language understood by the engine and op-application layer. |
-| `Expr` | The neutral AST that pieces compile into before rendering. |
-| `ProjectDocument` | Legacy schema-v2 wrapper for persisting a named graph. |
-
-Some design details are especially important when embedding Tessera:
-
-- Graph connectivity is side-aware. Param sides and output sides matter during validation and auto-wiring.
-- Parameters can be satisfied by upstream edges, inline values, or schema defaults.
-- Terminal pieces are pieces whose `output_type` is `None` or whose semantic kind is `Output`.
-- Runtime compilation is stricter than preview compilation: unresolved `Expr::Error` placeholders are rejected in runtime mode.
-
-## How To Use Tessera
-
-### 1. Minimal host integration
-
-The smallest useful integration is: define pieces, register them, build a graph, compile it, and render the terminal expressions.
+Define a piece catalog:
 
 ```rust
-use std::collections::BTreeMap;
+use tessera::*;
 
-use serde_json::Value;
-use tessera::{
-    CompileMode, Edge, EdgeId, Expr, Graph, GraphEngine, GridPos, HostAdapter, Node, ParamDef,
-    ParamSchema, Piece, PieceCategory, PieceDef, PieceInputs, PieceRegistry,
-    PieceSemanticKind, TileSide,
-};
-
-struct SourcePiece {
+struct NotePiece {
     def: PieceDef,
 }
 
-impl SourcePiece {
+impl NotePiece {
     fn new() -> Self {
         Self {
             def: PieceDef {
-                id: "demo.source".into(),
-                label: "source".into(),
+                id: "demo.text_literal".into(),
+                label: "text".into(),
                 category: PieceCategory::Generator,
-                semantic_kind: PieceSemanticKind::Operator,
+                semantic_kind: PieceSemanticKind::Literal,
                 namespace: "demo".into(),
-                params: vec![ParamDef {
-                    id: "value".into(),
-                    label: "value".into(),
-                    side: TileSide::BOTTOM,
-                    schema: ParamSchema::Text {
-                        default: "bd".into(),
-                        can_inline: true,
-                    },
-                    text_semantics: Default::default(),
-                    variadic_group: None,
-                    required: false,
-                }],
-                output_type: Some("text".into()),
+                params: vec![],
+                output_type: Some(PortType::text()),
                 output_side: Some(TileSide::RIGHT),
-                description: Some("Emit a text literal".into()),
+                output_role: Default::default(),
+                description: Some("A text value.".into()),
                 tags: vec!["demo".into()],
             },
         }
     }
 }
 
-impl Piece for SourcePiece {
+impl Piece for NotePiece {
     fn def(&self) -> &PieceDef {
         &self.def
     }
-
-    fn compile(
-        &self,
-        inputs: &PieceInputs,
-        _inline_params: &BTreeMap<String, Value>,
-    ) -> Expr {
-        inputs
-            .get("value")
-            .cloned()
-            .unwrap_or_else(|| Expr::str_lit("bd"))
-    }
-}
-
-struct OutputPiece {
-    def: PieceDef,
-}
-
-impl OutputPiece {
-    fn new() -> Self {
-        Self {
-            def: PieceDef {
-                id: "demo.output".into(),
-                label: "output".into(),
-                category: PieceCategory::Output,
-                semantic_kind: PieceSemanticKind::Output,
-                namespace: "demo".into(),
-                params: vec![ParamDef {
-                    id: "pattern".into(),
-                    label: "pattern".into(),
-                    side: TileSide::LEFT,
-                    schema: ParamSchema::Text {
-                        default: String::new(),
-                        can_inline: false,
-                    },
-                    text_semantics: Default::default(),
-                    variadic_group: None,
-                    required: true,
-                }],
-                output_type: None,
-                output_side: None,
-                description: Some("Terminal sink".into()),
-                tags: vec!["demo".into()],
-            },
-        }
-    }
-}
-
-impl Piece for OutputPiece {
-    fn def(&self) -> &PieceDef {
-        &self.def
-    }
-
-    fn compile(
-        &self,
-        inputs: &PieceInputs,
-        _inline_params: &BTreeMap<String, Value>,
-    ) -> Expr {
-        inputs
-            .get("pattern")
-            .cloned()
-            .unwrap_or_else(|| Expr::error("missing pattern"))
-    }
-}
-
-struct DemoHost;
-
-impl HostAdapter for DemoHost {
-    fn create_registry(&self) -> PieceRegistry {
-        let mut registry = PieceRegistry::new();
-        registry.register(SourcePiece::new());
-        registry.register(OutputPiece::new());
-        registry
-    }
-}
-
-fn main() {
-    let engine = GraphEngine::new(DemoHost);
-    let source_pos = GridPos { col: 0, row: 0 };
-    let output_pos = GridPos { col: 1, row: 0 };
-    let edge_id = EdgeId::new();
-
-    let graph = Graph {
-        nodes: BTreeMap::from([
-            (
-                source_pos,
-                Node {
-                    piece_id: "demo.source".into(),
-                    inline_params: BTreeMap::from([(
-                        "value".into(),
-                        Value::String("bd".into()),
-                    )]),
-                    input_sides: BTreeMap::new(),
-                    output_side: None,
-                    label: Some("kick".into()),
-                    node_state: None,
-                },
-            ),
-            (
-                output_pos,
-                Node {
-                    piece_id: "demo.output".into(),
-                    inline_params: BTreeMap::new(),
-                    input_sides: BTreeMap::from([("pattern".into(), TileSide::LEFT)]),
-                    output_side: None,
-                    label: Some("main out".into()),
-                    node_state: None,
-                },
-            ),
-        ]),
-        edges: BTreeMap::from([(
-            edge_id.clone(),
-            Edge {
-                id: edge_id,
-                from: source_pos,
-                to_node: output_pos,
-                to_param: "pattern".into(),
-            },
-        )]),
-        name: "demo".into(),
-        cols: 4,
-        rows: 1,
-    };
-
-    let sem = engine.analyze(&graph);
-    assert!(sem.is_valid());
-
-    let program = engine
-        .compile(&graph, CompileMode::Preview)
-        .expect("graph should compile");
-    let rendered = engine.render_terminals(&program.terminals);
-
-    assert_eq!(rendered, vec!["'bd'"]);
 }
 ```
 
-If your host wants Lua output instead of JavaScript, override `HostAdapter::backend()` and return `&LuaBackend`.
-
-### 2. Lower-level analysis, compilation, backends, and optimization
-
-`GraphEngine` is the easiest way to work with Tessera, but the lower-level functions are public too. That is useful if you want finer control over the pipeline or want to run custom passes in between.
+Build a registry and analyze a graph directly:
 
 ```rust
-use tessera::{
-    compile_graph, eliminate_dead_code, fold_constants, reachable_nodes, semantic_pass,
-    Backend, BinOp, CompileMode, Expr, JsBackend, LuaBackend,
-};
-
-let registry = DemoHost.create_registry();
-let sem = semantic_pass(&graph, &registry);
-let program = compile_graph(&graph, &registry, &sem, CompileMode::Preview)
-    .expect("graph should compile");
-
-let live_nodes = reachable_nodes(&graph, &sem.terminals);
-assert!(live_nodes.contains(&GridPos { col: 0, row: 0 }));
-
-let expr = fold_constants(&Expr::bin_op(BinOp::Add, Expr::int(1), Expr::int(2)));
-let expr = eliminate_dead_code(&expr);
-assert_eq!(JsBackend.render(&expr), "3");
-
-let call = Expr::method_call(Expr::str_lit("bd"), "fast", vec![]);
-assert_eq!(JsBackend.render(&call), "'bd'.fast()");
-assert_eq!(LuaBackend.render(&call), "'bd':fast()");
-```
-
-### 3. Serialized graph and project data
-
-`Graph` is the main persisted workspace type. `ProjectDocument` is a legacy wrapper retained for schema-v2 migration and still useful if you want a named top-level document shape.
-
-This is the serialized shape you should expect for a small project:
-
-```json
-{
-  "schema_version": 2,
-  "name": "Demo Project",
-  "graph": {
-    "nodes": [
-      {
-        "position": { "col": 0, "row": 0 },
-        "node": {
-          "piece_id": "demo.source",
-          "inline_params": { "value": "bd" },
-          "input_sides": {},
-          "output_side": null,
-          "label": "kick"
-        }
-      },
-      {
-        "position": { "col": 1, "row": 0 },
-        "node": {
-          "piece_id": "demo.output",
-          "inline_params": {},
-          "input_sides": { "pattern": "left" },
-          "output_side": null,
-          "label": "main out"
-        }
-      }
-    ],
-    "edges": {
-      "11111111-1111-4111-8111-111111111111": {
-        "id": "11111111-1111-4111-8111-111111111111",
-        "from": { "col": 0, "row": 0 },
-        "to_node": { "col": 1, "row": 0 },
-        "to_param": "pattern"
-      }
-    },
-    "name": "demo",
-    "cols": 4,
-    "rows": 1
-  }
-}
-```
-
-Two serialization details are easy to miss:
-
-- `nodes` serialize as an array of `{ position, node }` entries rather than a JSON object keyed by coordinates.
-- `input_sides` serialize as plain string enums such as `"left"` or `"bottom"`.
-
-### 4. Applying graph operations
-
-Hosts can mutate graphs directly, but `GraphOp` plus `GraphEngine::apply_ops()` is the intended engine-level mutation path because it validates, canonicalizes, and returns undo information.
-
-```rust
-use tessera::{BatchPlaceEdge, BatchPlaceEntry, GraphOp};
-
-let engine = GraphEngine::new(DemoHost);
-let mut graph = Graph {
-    nodes: BTreeMap::new(),
-    edges: BTreeMap::new(),
-    name: "ops".into(),
-    cols: 4,
-    rows: 1,
-};
-
-let outcome = engine
-    .apply_ops(
-        &mut graph,
-        &[GraphOp::NodeBatchPlace {
-            nodes: vec![
-                BatchPlaceEntry {
-                    position: GridPos { col: 0, row: 0 },
-                    piece_id: "demo.source".into(),
-                    inline_params: BTreeMap::from([(
-                        "value".into(),
-                        Value::String("bd".into()),
-                    )]),
-                    input_sides: BTreeMap::new(),
-                    output_side: None,
-                    label: Some("src".into()),
-                },
-                BatchPlaceEntry {
-                    position: GridPos { col: 1, row: 0 },
-                    piece_id: "demo.output".into(),
-                    inline_params: BTreeMap::new(),
-                    input_sides: BTreeMap::from([("pattern".into(), TileSide::LEFT)]),
-                    output_side: None,
-                    label: Some("out".into()),
-                },
-            ],
-            edges: vec![BatchPlaceEdge {
-                from: GridPos { col: 0, row: 0 },
-                to_node: GridPos { col: 1, row: 0 },
-                to_param: "pattern".into(),
-            }],
-            auto_wire: false,
-        }],
-    )
-    .expect("batch place should succeed");
-
-assert_eq!(graph.nodes.len(), 2);
-assert_eq!(graph.edges.len(), 1);
-assert!(!outcome.undo_ops.is_empty());
-
-let removed = engine
-    .apply_ops(
-        &mut graph,
-        &[GraphOp::NodeRemove {
-            position: GridPos { col: 0, row: 0 },
-        }],
-    )
-    .expect("remove should succeed");
-
-assert_eq!(graph.nodes.len(), 1);
-assert_eq!(removed.removed_edges.len(), 1);
-```
-
-For editor-driven wiring, the lower-level edge helpers are often useful too:
-
-- `probe_edge_connect()` tries a connection and returns structured accept/reject information.
-- `pick_target_param_for_edge()` can auto-select the best target param based on adjacency, type, and side.
-- `validate_edge_connect()` checks an explicit connection.
-- `RepairSuggestion` values can be turned back into `GraphOp`s with `to_ops()`.
-
-### 5. Registering the built-in core expression pieces
-
-The engine ships a small target-agnostic core piece set. Today that includes:
-
-- `core.if_expr`
-- `core.not`
-- `core.and`
-- `core.or`
-- `core.eq`
-- `core.gt`
-- `core.lt`
-
-You can add them to a registry like this:
-
-```rust
-use std::sync::Arc;
-
-use tessera::{core_expression_pieces, PieceRegistry};
+use tessera::*;
 
 let mut registry = PieceRegistry::new();
+registry.register(NotePiece::new());
 
-for piece in core_expression_pieces() {
-    let id = piece.def().id.clone();
-    registry.register_arc(id, Arc::from(piece));
-}
+let analyzed = semantic_pass(&graph, &registry);
 
-let logic_pieces = registry.search_by_tag("logic");
-assert!(logic_pieces.iter().any(|def| def.id == "core.not"));
-```
+if analyzed.is_valid() {
+    for (output_pos, output_node) in analyzed.output_nodes() {
+        let _site = output_pos;
+        let _piece = &output_node.piece_id;
 
-These pieces lower into the shared `Expr` AST. They do not contain host-specific runtime logic.
-
-### 6. Defining and compiling subgraphs
-
-Subgraphs let a host treat one graph as a reusable macro-like piece. Tessera provides the boundary pieces plus compilation helpers; the host still decides how compiled subgraphs become part of the runtime registry.
-
-This example creates a one-input subgraph that compiles to `src.xform()`:
-
-```rust
-use std::sync::Arc;
-
-use tessera::{
-    compile_subgraph, subgraph_editor_pieces, subgraph_pieces, ParamInlineMode, ParamValueKind,
-    PortType, SubgraphDef, SUBGRAPH_INPUT_1_ID, SUBGRAPH_OUTPUT_ID,
-};
-
-struct TransformPiece {
-    def: PieceDef,
-}
-
-impl TransformPiece {
-    fn new() -> Self {
-        Self {
-            def: PieceDef {
-                id: "demo.transform".into(),
-                label: "xform".into(),
-                category: PieceCategory::Transform,
-                semantic_kind: PieceSemanticKind::Operator,
-                namespace: "demo".into(),
-                params: vec![ParamDef {
-                    id: "input".into(),
-                    label: "input".into(),
-                    side: TileSide::LEFT,
-                    schema: ParamSchema::Custom {
-                        port_type: PortType::any(),
-                        value_kind: ParamValueKind::None,
-                        default: None,
-                        can_inline: false,
-                        inline_mode: ParamInlineMode::Literal,
-                        min: None,
-                        max: None,
-                    },
-                    text_semantics: Default::default(),
-                    variadic_group: None,
-                    required: true,
-                }],
-                output_type: Some(PortType::any()),
-                output_side: Some(TileSide::RIGHT),
-                description: Some("Apply a method call".into()),
-                tags: vec!["demo".into()],
-            },
-        }
+        // Walk the output roots and lower from resolved inputs into your host.
     }
 }
-
-impl Piece for TransformPiece {
-    fn def(&self) -> &PieceDef {
-        &self.def
-    }
-
-    fn compile(
-        &self,
-        inputs: &PieceInputs,
-        _inline_params: &BTreeMap<String, Value>,
-    ) -> Expr {
-        Expr::method_call(
-            inputs
-                .get("input")
-                .cloned()
-                .unwrap_or_else(|| Expr::error("missing input")),
-            "xform",
-            vec![],
-        )
-    }
-}
-
-let mut editor_registry = PieceRegistry::new();
-for piece in subgraph_editor_pieces() {
-    let id = piece.def().id.clone();
-    editor_registry.register_arc(id, Arc::from(piece));
-}
-editor_registry.register(TransformPiece::new());
-
-let input_pos = GridPos { col: 0, row: 0 };
-let transform_pos = GridPos { col: 1, row: 0 };
-let output_pos = GridPos { col: 2, row: 0 };
-let edge_a = EdgeId::new();
-let edge_b = EdgeId::new();
-
-let subgraph = SubgraphDef {
-    id: "demo_xform".into(),
-    name: "demo xform".into(),
-    graph: Graph {
-        nodes: BTreeMap::from([
-            (
-                input_pos,
-                Node {
-                    piece_id: SUBGRAPH_INPUT_1_ID.into(),
-                    inline_params: BTreeMap::from([("label".into(), Value::String("src".into()))]),
-                    input_sides: BTreeMap::new(),
-                    output_side: None,
-                    label: None,
-                    node_state: None,
-                },
-            ),
-            (
-                transform_pos,
-                Node {
-                    piece_id: "demo.transform".into(),
-                    inline_params: BTreeMap::new(),
-                    input_sides: BTreeMap::from([("input".into(), TileSide::LEFT)]),
-                    output_side: None,
-                    label: None,
-                    node_state: None,
-                },
-            ),
-            (
-                output_pos,
-                Node {
-                    piece_id: SUBGRAPH_OUTPUT_ID.into(),
-                    inline_params: BTreeMap::new(),
-                    input_sides: BTreeMap::from([("input".into(), TileSide::LEFT)]),
-                    output_side: None,
-                    label: None,
-                    node_state: None,
-                },
-            ),
-        ]),
-        edges: BTreeMap::from([
-            (
-                edge_a.clone(),
-                Edge {
-                    id: edge_a,
-                    from: input_pos,
-                    to_node: transform_pos,
-                    to_param: "input".into(),
-                },
-            ),
-            (
-                edge_b.clone(),
-                Edge {
-                    id: edge_b,
-                    from: transform_pos,
-                    to_node: output_pos,
-                    to_param: "input".into(),
-                },
-            ),
-        ]),
-        name: "demo subgraph".into(),
-        cols: 4,
-        rows: 1,
-    },
-};
-
-let compiled = compile_subgraph(&subgraph, &editor_registry)
-    .expect("subgraph should compile");
-assert_eq!(compiled.signature.inputs.len(), 1);
-
-let generated = subgraph_pieces(std::slice::from_ref(&compiled));
-let mut runtime_registry = PieceRegistry::new();
-runtime_registry.register(generated[0].clone());
 ```
 
-Important current subgraph rules:
+## The Main Contract
 
-- A subgraph can declare at most three inputs.
-- It must contain exactly one subgraph output piece.
-- It may declare at most one receiver input.
-- Generated pieces are regular `Piece`s that you can register into a host registry.
+The stable host-facing contract is:
 
-### 7. Activity and probe snapshots
+- `AnalyzedGraph`
+- `AnalyzedNode`
+- `ResolvedInput`
+- `ResolvedInputSource`
+- `AnalysisCache`
+- `SubgraphInput`
+- `SubgraphSignature`
 
-Tessera also defines host-facing runtime feedback types for pulsing nodes, current probe values, and preview animation timelines. The core engine does not own runtime data; the host produces events and shapes them into snapshots.
+That surface is meant to be enough for a host crate to do its own lowering
+without Tessera knowing the target host representation.
 
-```rust
-use serde_json::json;
-use tessera::{ActivityEvent, HostTime, ProbeEvent};
+## What Tessera Gives You
 
-let engine = GraphEngine::new(DemoHost);
+- A typed tile grid with adjacency and side rules
+- Deterministic output roots and evaluation order
+- Per-input source resolution for edge, inline, default, and missing values
+- Effective type inference and domain bridge metadata
+- Native port matching based on exact type identity, `any`, and supported domain bridges
+- Delay-edge classification for feedback flows
+- Connector traversal that normalizes pass-through routing into real upstream sources
+- Piece-local semantic diagnostics over normalized analyzed nodes
+- Connection probing with human-readable repair suggestions
+- Subgraph signatures that describe reusable boundaries
+- Incremental analysis caching across graph edits
+- Full serde support for public graph and analysis types
 
-let activity = engine.build_activity_snapshot(
-    &[ActivityEvent::trigger(GridPos { col: 0, row: 0 })
-        .with_label("kick")
-        .at(HostTime::seconds(0.0))],
-    Some(HostTime::seconds(0.0)),
-);
+Placed nodes must keep each input side unique. Tessera rejects edits that
+assign multiple params on the same node to the same side, and persisted graphs
+that violate that rule analyze with explicit diagnostics.
 
-let probes = engine.build_probe_snapshot(
-    &[ProbeEvent::new(
-        GridPos { col: 1, row: 0 },
-        json!({ "rendered": "'bd'" }),
-    )],
-    Some(HostTime::seconds(0.0)),
-);
+Piece implementations can also add read-only semantic diagnostics during
+analysis through `Piece::validate_analysis`. That hook receives the final
+normalized `AnalyzedNode`, so host crates can express piece-specific invariants
+without pulling host-specific concerns into Tessera itself.
 
-assert!(!activity.is_empty());
-assert_eq!(
-    probes.value_at(&GridPos { col: 1, row: 0 }),
-    Some(&json!({ "rendered": "'bd'" }))
-);
-```
+Connector pieces are also first-class in analysis. When a piece is marked as a
+connector, Tessera treats single-input connector chains as transparent during
+source resolution, type checks, bridge detection, and connection probing. Edge
+sources can therefore report the real upstream producer plus any traversed
+connector positions in `ResolvedInputSource::Edge.via`.
 
-If your host wants custom decay, coalescing, filtering, or value formatting, override `HostAdapter::build_activity_snapshot()` or `HostAdapter::build_probe_snapshot()`.
+## Subgraphs
 
-## Built-ins vs Host Responsibilities
+Use `analyze_subgraph` to turn a subgraph definition into a stable signature.
+Use `subgraph_editor_pieces` for boundary marker pieces in an editor, and
+`subgraph_pieces` when you want reusable piece definitions from saved
+signatures.
 
-Tessera intentionally keeps the boundary between engine behavior and host behavior clear.
+## Design Note
 
-Tessera currently ships:
+Tessera may study external systems such as Psi for design inspiration, but the
+crate stays clean-room at the code and API level. Reuse ideas and behaviors,
+not source code, assets, or copied surface design.
 
-- The graph, AST, diagnostic, backend, and op systems.
-- The `GraphEngine` integration wrapper.
-- Core expression pieces via `core_expression_pieces()`.
-- Subgraph boundary and generated-piece helpers via `subgraph_editor_pieces()`, `compile_subgraph()`, `compile_subgraphs()`, and `subgraph_pieces()`.
-- Runtime feedback value types such as `ActivityEvent`, `ActivitySnapshot`, `ProbeEvent`, `ProbeSnapshot`, and `PreviewTimeline`.
+## License
 
-The host is responsible for:
-
-- Domain-specific pieces and registries.
-- UI/editor behavior, layout, palette organization, and persistence choices.
-- Target-specific adaptation beyond the shared AST and backend rules.
-- Runtime execution, scheduling, transport, playback, and side effects.
-- How compiled terminal expressions are combined, interpreted, or sent downstream.
-
-## Current Limitations And Non-Goals
-
-- This crate is a library core, not a standalone visual editor application.
-- It is not published to crates.io yet, so integration currently assumes a path or workspace dependency.
-- The built-in reusable piece set is intentionally small: core expression pieces plus subgraph helpers.
-- Domain registries, runtime systems, and editor UX are expected to live in the host.
-- The examples in this README show embedding Tessera into another Rust application, not launching a finished end-user product.
-
-## Public API Checklist
-
-If you are scanning the crate surface before adopting it, these are the main entry points to know:
-
-- Graph model: `Graph`, `Node`, `Edge`, `ProjectDocument`
-- Mutation model: `GraphOp`, `BatchPlaceEntry`, `BatchPlaceEdge`, `apply_ops_to_graph()`
-- Piece model: `Piece`, `PieceDef`, `ParamDef`, `ParamSchema`, `PieceInputs`, `PieceRegistry`
-- Engine integration: `HostAdapter`, `GraphEngine`
-- Compilation: `CompileMode`, `CompileProgram`, `compile_graph()`, `semantic_pass()`
-- Rendering: `Backend`, `JsBackend`, `LuaBackend`
-- Subgraphs: `SubgraphDef`, `compile_subgraph()`, `compile_subgraphs()`, `subgraph_pieces()`, `subgraph_editor_pieces()`
-- Runtime feedback: `ActivityEvent`, `ActivitySnapshot`, `ProbeEvent`, `ProbeSnapshot`, `PreviewTimeline`
-- Optimization helpers: `fold_constants()`, `eliminate_dead_code()`, `reachable_nodes()`
-
-## Development Note
-
-The examples in this README are derived from the current public API and the existing test suite in this repository. If you extend the engine surface, the README should be updated alongside the tests so the crate stays understandable to new host integrators.
+MIT OR Apache-2.0

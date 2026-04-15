@@ -1,7 +1,10 @@
 use std::cmp::Ordering;
+use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
+
+pub const DELAY_PIECE_ID: &str = "tessera.delay";
 
 // Determinism contract: GridPos ordering is always col-first, then row.
 // Keep Ord impl explicit so future field edits do not silently change topo tie-breaking.
@@ -135,6 +138,110 @@ pub struct DomainBridge {
     pub kind: DomainBridgeKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Rational {
+    numerator: i64,
+    denominator: i64,
+}
+
+impl Rational {
+    pub const ZERO: Self = Self {
+        numerator: 0,
+        denominator: 1,
+    };
+
+    pub const ONE: Self = Self {
+        numerator: 1,
+        denominator: 1,
+    };
+
+    pub fn new(numerator: i64, denominator: i64) -> Option<Self> {
+        if denominator == 0 {
+            return None;
+        }
+
+        let gcd = gcd(numerator.abs(), denominator.abs());
+        let mut numerator = numerator / gcd;
+        let mut denominator = denominator / gcd;
+        if denominator < 0 {
+            numerator *= -1;
+            denominator *= -1;
+        }
+
+        Some(Self {
+            numerator,
+            denominator,
+        })
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        if let Some((numerator, denominator)) = trimmed.split_once('/') {
+            let numerator = numerator.trim().parse::<i64>().ok()?;
+            let denominator = denominator.trim().parse::<i64>().ok()?;
+            return Self::new(numerator, denominator);
+        }
+
+        trimmed
+            .parse::<i64>()
+            .ok()
+            .and_then(|value| Self::new(value, 1))
+    }
+
+    pub fn numerator(self) -> i64 {
+        self.numerator
+    }
+
+    pub fn denominator(self) -> i64 {
+        self.denominator
+    }
+}
+
+impl fmt::Display for Rational {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.denominator == 1 {
+            write!(f, "{}", self.numerator)
+        } else {
+            write!(f, "{}/{}", self.numerator, self.denominator)
+        }
+    }
+}
+
+impl Serialize for Rational {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Rational {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value)
+            .ok_or_else(|| serde::de::Error::custom(format!("invalid rational literal '{value}'")))
+    }
+}
+
+fn gcd(lhs: i64, rhs: i64) -> i64 {
+    let mut lhs = lhs;
+    let mut rhs = rhs;
+    while rhs != 0 {
+        let remainder = lhs % rhs;
+        lhs = rhs;
+        rhs = remainder;
+    }
+    lhs.max(1)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PortType {
     kind: String,
@@ -171,6 +278,10 @@ impl PortType {
 
     pub fn bool() -> Self {
         Self::new("bool")
+    }
+
+    pub fn rational() -> Self {
+        Self::new("rational")
     }
 
     pub fn any() -> Self {
@@ -249,11 +360,7 @@ impl PortType {
     }
 
     fn accepts_value(&self, other: &PortType) -> bool {
-        self.is_any()
-            || other.is_any()
-            || self == other
-            // In mini-notation languages a text string is a valid pattern literal.
-            || (self.as_str() == "pattern" && other.as_str() == "text")
+        self.is_any() || other.is_any() || self.kind == other.kind
     }
 
     fn common_value_type(&self, other: &PortType) -> Option<PortType> {
@@ -337,8 +444,8 @@ impl<'de> Deserialize<'de> for PortType {
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum PortTypeRepr {
-            Legacy(String),
-            Rich {
+            Plain(String),
+            Full {
                 kind: String,
                 #[serde(default)]
                 domain: Option<ExecutionDomain>,
@@ -346,29 +453,24 @@ impl<'de> Deserialize<'de> for PortType {
         }
 
         match PortTypeRepr::deserialize(deserializer)? {
-            PortTypeRepr::Legacy(kind) => Ok(Self {
+            PortTypeRepr::Plain(kind) => Ok(Self {
                 kind,
                 domain: Some(ExecutionDomain::Control),
             }),
-            PortTypeRepr::Rich { kind, domain } => Ok(Self { kind, domain }),
+            PortTypeRepr::Full { kind, domain } => Ok(Self { kind, domain }),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum TileSide {
-    #[serde(rename = "top", alias = "north", alias = "t_o_p")]
+    #[serde(rename = "top", alias = "north")]
     TOP,
-    #[serde(
-        rename = "bottom",
-        alias = "south",
-        alias = "buttom",
-        alias = "b_o_t_t_o_m"
-    )]
+    #[serde(rename = "bottom", alias = "south")]
     BOTTOM,
-    #[serde(rename = "right", alias = "east", alias = "r_i_g_h_t")]
+    #[serde(rename = "right", alias = "east")]
     RIGHT,
-    #[serde(rename = "left", alias = "west", alias = "l_e_f_t")]
+    #[serde(rename = "left", alias = "west")]
     LEFT,
 }
 
@@ -417,14 +519,35 @@ pub enum PieceSemanticKind {
     Connector,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PortRole {
+    #[default]
+    Value,
+    Gate,
+    Signal,
+    Callback,
+    Sequence,
+    Field {
+        name: String,
+    },
+}
+
+impl PortRole {
+    pub fn is_value(&self) -> bool {
+        matches!(self, PortRole::Value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        DomainBridgeKind, ExecutionDomain, PieceCategory, PieceSemanticKind, PortType, TileSide,
+        DomainBridgeKind, ExecutionDomain, PieceCategory, PieceSemanticKind, PortType,
+        PortTypeConnectionError, Rational, TileSide,
     };
 
     #[test]
-    fn tile_side_deserializes_legacy_and_typo_variants() {
+    fn tile_side_deserializes_cardinal_aliases() {
         assert_eq!(
             serde_json::from_str::<TileSide>("\"north\"").unwrap(),
             TileSide::TOP
@@ -434,20 +557,12 @@ mod tests {
             TileSide::BOTTOM
         );
         assert_eq!(
-            serde_json::from_str::<TileSide>("\"buttom\"").unwrap(),
-            TileSide::BOTTOM
-        );
-        assert_eq!(
             serde_json::from_str::<TileSide>("\"east\"").unwrap(),
             TileSide::RIGHT
         );
         assert_eq!(
             serde_json::from_str::<TileSide>("\"west\"").unwrap(),
             TileSide::LEFT
-        );
-        assert_eq!(
-            serde_json::from_str::<TileSide>("\"t_o_p\"").unwrap(),
-            TileSide::TOP
         );
     }
 
@@ -478,6 +593,32 @@ mod tests {
     }
 
     #[test]
+    fn rational_literals_parse_and_normalize() {
+        assert_eq!(Rational::parse("1/4"), Some(Rational::new(1, 4).unwrap()));
+        assert_eq!(Rational::parse("-2/4"), Some(Rational::new(-1, 2).unwrap()));
+        assert_eq!(Rational::parse("3"), Some(Rational::new(3, 1).unwrap()));
+    }
+
+    #[test]
+    fn rational_literals_reject_invalid_forms() {
+        assert_eq!(Rational::parse("1/0"), None);
+        assert_eq!(Rational::parse("abc"), None);
+        assert_eq!(Rational::parse("1//4"), None);
+        assert_eq!(Rational::parse("0.25"), None);
+    }
+
+    #[test]
+    fn rational_serializes_canonically() {
+        let value = Rational::new(-2, 4).unwrap();
+        assert_eq!(value.to_string(), "-1/2");
+        assert_eq!(serde_json::to_string(&value).unwrap(), "\"-1/2\"");
+        assert_eq!(
+            serde_json::from_str::<Rational>("\"-1/2\"").unwrap(),
+            Rational::new(-1, 2).unwrap()
+        );
+    }
+
+    #[test]
     fn port_type_common_type_prefers_specific_over_any() {
         assert_eq!(
             PortType::any().common_type(&PortType::number()),
@@ -490,70 +631,62 @@ mod tests {
     }
 
     #[test]
-    fn port_type_common_type_uses_compatible_pattern_supertype() {
-        assert_eq!(
-            PortType::new("pattern").common_type(&PortType::text()),
-            Some(PortType::new("pattern"))
-        );
-    }
-
-    #[test]
     fn port_type_common_type_returns_none_for_incompatible_types() {
         assert_eq!(PortType::number().common_type(&PortType::bool()), None);
     }
 
     #[test]
-    fn port_type_deserializes_legacy_string_to_control_domain() {
-        let port = serde_json::from_str::<PortType>("\"number\"").expect("deserialize port type");
-        assert_eq!(port, PortType::number());
-        assert_eq!(port.domain(), Some(ExecutionDomain::Control));
+    fn port_type_resolve_connection_preserves_exact_matches() {
+        let connection = PortType::text()
+            .resolve_connection(&PortType::text())
+            .expect("exact match");
+
+        assert_eq!(connection.effective_type, PortType::text());
+        assert_eq!(connection.bridge_kind, None);
     }
 
     #[test]
-    fn port_type_round_trips_audio_domain_as_object() {
-        let port = PortType::number().with_domain(ExecutionDomain::Audio);
-        let json = serde_json::to_value(&port).expect("serialize port type");
-        assert_eq!(json, serde_json::json!({"kind": "number", "domain": "audio"}));
-        let round_trip: PortType = serde_json::from_value(json).expect("deserialize port type");
-        assert_eq!(round_trip, port);
+    fn port_type_resolve_connection_prefers_concrete_type_over_any() {
+        let connection = PortType::any()
+            .resolve_connection(&PortType::number())
+            .expect("any should accept number");
+
+        assert_eq!(connection.effective_type, PortType::number());
+        assert_eq!(connection.bridge_kind, None);
     }
 
     #[test]
-    fn port_type_round_trips_unspecified_domain_as_kind_only_object() {
-        let port = PortType::new("pattern").with_unspecified_domain();
-        let json = serde_json::to_value(&port).expect("serialize port type");
-        assert_eq!(json, serde_json::json!({"kind": "pattern"}));
-        let round_trip: PortType = serde_json::from_value(json).expect("deserialize port type");
-        assert_eq!(round_trip, port);
-        assert_eq!(round_trip.domain(), None);
-    }
+    fn port_type_resolve_connection_reports_supported_domain_bridges() {
+        let connection = PortType::number()
+            .resolve_connection(&PortType::number().with_domain(ExecutionDomain::Audio))
+            .expect("audio -> control bridge");
 
-    #[test]
-    fn resolve_connection_allows_supported_domain_bridge() {
-        let expected = PortType::number().with_domain(ExecutionDomain::Audio);
-        let source = PortType::number().with_domain(ExecutionDomain::Control);
-        let resolution = expected
-            .resolve_connection(&source)
-            .expect("bridgeable connection");
-
+        assert_eq!(connection.effective_type, PortType::number());
         assert_eq!(
-            resolution.bridge_kind,
-            Some(DomainBridgeKind::ControlToAudio)
+            connection.bridge_kind,
+            Some(DomainBridgeKind::AudioToControl)
         );
-        assert_eq!(resolution.effective_type, expected);
     }
 
     #[test]
-    fn resolve_connection_rejects_unsupported_domain_bridge() {
-        let expected = PortType::number().with_domain(ExecutionDomain::Event);
-        let source = PortType::number().with_domain(ExecutionDomain::Audio);
-        let err = expected
-            .resolve_connection(&source)
-            .expect_err("unsupported bridge");
+    fn port_type_resolve_connection_rejects_unsupported_domain_bridges() {
+        let err = PortType::number()
+            .with_domain(ExecutionDomain::Event)
+            .resolve_connection(&PortType::number().with_domain(ExecutionDomain::Audio));
 
         assert!(matches!(
             err,
-            super::PortTypeConnectionError::UnsupportedDomain { .. }
+            Err(PortTypeConnectionError::UnsupportedDomain { .. })
         ));
+    }
+
+    #[test]
+    fn domain_bridge_kind_source_target_domain_round_trip() {
+        let bridge =
+            DomainBridgeKind::from_domains(ExecutionDomain::Control, ExecutionDomain::Audio)
+                .expect("control -> audio");
+
+        assert_eq!(bridge.source_domain(), ExecutionDomain::Control);
+        assert_eq!(bridge.target_domain(), ExecutionDomain::Audio);
     }
 }

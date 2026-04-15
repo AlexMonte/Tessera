@@ -1,9 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::types::{DomainBridge, EdgeId, GridPos, PortType, TileSide};
+use crate::types::{EdgeId, GridPos, PortType, TileSide};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -16,6 +14,11 @@ pub enum DiagnosticSeverity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DiagnosticKind {
+    PieceSemantic {
+        piece_id: String,
+        code: String,
+        message: String,
+    },
     UnknownPiece {
         piece_id: String,
     },
@@ -33,13 +36,14 @@ pub enum DiagnosticKind {
         to_node: GridPos,
         to_param: String,
     },
+    DuplicateInputSide {
+        side: TileSide,
+        params: Vec<String>,
+    },
     Cycle {
         involved: Vec<GridPos>,
     },
-    NoTerminalNode,
-    MultipleTerminalNodes {
-        positions: Vec<GridPos>,
-    },
+    NoOutputNode,
     UnreachableNode {
         position: GridPos,
     },
@@ -109,37 +113,64 @@ impl Diagnostic {
         }
     }
 
+    pub fn info(kind: DiagnosticKind, site: Option<GridPos>) -> Self {
+        Self {
+            kind,
+            site,
+            edge_id: None,
+            severity: DiagnosticSeverity::Info,
+        }
+    }
+
+    pub fn piece_semantic(
+        severity: DiagnosticSeverity,
+        piece_id: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        site: Option<GridPos>,
+    ) -> Self {
+        let kind = DiagnosticKind::PieceSemantic {
+            piece_id: piece_id.into(),
+            code: code.into(),
+            message: message.into(),
+        };
+
+        match severity {
+            DiagnosticSeverity::Error => Self::error(kind, site),
+            DiagnosticSeverity::Warning => Self::warning(kind, site),
+            DiagnosticSeverity::Info => Self::info(kind, site),
+        }
+    }
+
+    pub fn piece_semantic_error(
+        piece_id: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        site: Option<GridPos>,
+    ) -> Self {
+        Self::piece_semantic(DiagnosticSeverity::Error, piece_id, code, message, site)
+    }
+
+    pub fn piece_semantic_warning(
+        piece_id: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        site: Option<GridPos>,
+    ) -> Self {
+        Self::piece_semantic(DiagnosticSeverity::Warning, piece_id, code, message, site)
+    }
+
+    pub fn piece_semantic_info(
+        piece_id: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        site: Option<GridPos>,
+    ) -> Self {
+        Self::piece_semantic(DiagnosticSeverity::Info, piece_id, code, message, site)
+    }
+
     pub fn with_edge(mut self, edge_id: EdgeId) -> Self {
         self.edge_id = Some(edge_id);
         self
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SemanticResult {
-    pub diagnostics: Vec<Diagnostic>,
-    pub eval_order: Vec<GridPos>,
-    /// All terminal nodes found.
-    pub terminals: Vec<GridPos>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub output_types: BTreeMap<GridPos, PortType>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub domain_bridges: BTreeMap<EdgeId, DomainBridge>,
-    /// Edges classified as delay (feedback) edges.
-    ///
-    /// These edges target a `core.delay` node's `"value"` param and are
-    /// excluded from the topological sort so that cycles through delay
-    /// nodes are legal.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub delay_edges: BTreeSet<EdgeId>,
-}
-
-impl SemanticResult {
-    pub fn is_valid(&self) -> bool {
-        let has_error = self
-            .diagnostics
-            .iter()
-            .any(|d| d.severity == DiagnosticSeverity::Error);
-        !has_error && !self.terminals.is_empty()
     }
 }

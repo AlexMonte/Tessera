@@ -1,16 +1,13 @@
-//! Tessera: a host-agnostic typed graph engine for visual music/program editors.
+//! Tessera: a host-agnostic graph analysis kernel for visual editors.
 //!
-//! Architectural rule: target-specific AST adaptation belongs in host/target
-//! layers. The core library stays target-agnostic.
+//! Tessera owns editable graph structure, mutation ops, validation, and
+//! deterministic semantic analysis. Host crates own domain-specific lowering
+//! from analyzed graphs into their own representations.
 
-pub mod activity;
-pub mod ast;
-pub mod backend;
-pub mod compiler;
-pub mod core_pieces;
+pub mod analysis;
 pub mod diagnostics;
 pub mod graph;
-pub mod host;
+mod internal;
 pub mod ops;
 pub mod piece;
 pub mod piece_registry;
@@ -18,69 +15,149 @@ pub mod semantic;
 pub mod subgraph;
 pub mod types;
 
-pub use activity::{
-    ActivityEvent, ActivityKind, ActivitySnapshot, HostTime, PreviewTimeline, ProbeEvent,
-    ProbeSnapshot, TimelineStep,
+pub mod prelude {
+    pub use crate::{
+        AnalysisCache, AnalyzedGraph, AnalyzedNode, Diagnostic, Edge, EdgeId, Graph, GridPos, Node,
+        ParamDef, ParamSchema, Piece, PieceCategory, PieceDef, PieceExecutionKind, PieceRegistry,
+        PieceSemanticKind, PortRole, PortType, Rational, TileSide,
+    };
+}
+
+pub use analysis::{
+    AnalysisCache, AnalyzedGraph, AnalyzedNode, ResolvedInput, ResolvedInputSource,
 };
-pub use ast::{
-    BinOp, Expr, ExprKind, Lit, OptLevel, Origin, StringSyntax, UnaryOp, is_valid_ident_path,
-    is_valid_ident_segment, parse_ident_path,
-};
-pub use backend::{Backend, JsBackend, LuaBackend};
-pub use compiler::{
-    CompileCache, CompileMode, CompileProgram, DelaySlot, NodeStateUpdate, compile_graph,
-    compile_graph_cached, compile_graph_cached_with_opts, compile_graph_with_opts,
-    compile_node_expr, compile_node_expr_with_opts,
-};
-pub use core_pieces::{DELAY_PIECE_ID, core_expression_pieces};
-pub use diagnostics::{Diagnostic, DiagnosticKind, DiagnosticSeverity, SemanticResult};
-pub use graph::{
-    BatchPlaceEdge, BatchPlaceEntry, Edge, Graph, GraphOp, GraphOpRecord, Node, ProjectDocument,
-};
-pub use host::{GraphEngine, HostAdapter};
+pub use diagnostics::{Diagnostic, DiagnosticKind, DiagnosticSeverity};
+pub use graph::{BatchPlaceEdge, BatchPlaceEntry, Edge, Graph, GraphOp, GraphOpRecord, Node};
 pub use ops::{
     ApplyOpsOutcome, EdgeConnectProbeReason, EdgeTargetParamProbe, RepairSuggestion,
     apply_ops_to_graph, apply_ops_to_graph_cached, pick_target_param_for_edge, probe_edge_connect,
     validate_edge_connect,
 };
 pub use piece::{
-    ParamDef, ParamInlineMode, ParamSchema, ParamValueKind, Piece, PieceDef, PieceInputs,
-    ResolvedPieceTypes,
+    ParamDef, ParamInlineMode, ParamSchema, ParamTextSemantics, ParamValueKind, Piece, PieceDef,
+    PieceExecutionKind, is_valid_ident_path, is_valid_ident_segment,
 };
 pub use piece_registry::PieceRegistry;
-pub use semantic::semantic_pass;
+pub use semantic::{analyze_cached, semantic_pass};
 pub use subgraph::{
-    CompiledSubgraph, GeneratedSubgraphPiece, SUBGRAPH_INPUT_1_ID, SUBGRAPH_INPUT_2_ID,
-    SUBGRAPH_INPUT_3_ID, SUBGRAPH_OUTPUT_ID, SubgraphDef, SubgraphInput, SubgraphInputPiece,
-    SubgraphOutputPiece, SubgraphSignature, analyze_subgraph, compile_subgraph, compile_subgraphs,
-    subgraph_editor_pieces, subgraph_pieces,
+    GeneratedSubgraphPiece, SUBGRAPH_INPUT_1_ID, SUBGRAPH_INPUT_2_ID, SUBGRAPH_INPUT_3_ID,
+    SUBGRAPH_OUTPUT_ID, SubgraphDef, SubgraphInput, SubgraphInputPiece, SubgraphOutputPiece,
+    SubgraphSignature, analyze_subgraph, subgraph_editor_pieces, subgraph_pieces,
 };
 pub use types::{
-    DomainBridge, DomainBridgeKind, EdgeId, ExecutionDomain, GridPos, PieceCategory,
-    PieceSemanticKind, PortType, TileSide, adjacent_in_direction,
+    DELAY_PIECE_ID, DomainBridge, DomainBridgeKind, EdgeId, ExecutionDomain, GridPos,
+    PieceCategory, PieceSemanticKind, PortRole, PortType, Rational, TileSide,
+    adjacent_in_direction,
 };
 
 #[cfg(test)]
 mod tests {
-    use super::{CompileCache, GridPos, ProbeEvent, ProbeSnapshot};
-    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    use super::{AnalysisCache, Graph};
 
     #[test]
-    fn crate_reexports_probe_types() {
-        let pos = GridPos { col: 0, row: 0 };
-        let expected = json!(0.75);
-        let event = ProbeEvent::new(pos, expected.clone());
-        let mut snapshot = ProbeSnapshot::new();
-        snapshot.values.insert(pos, expected.clone());
-
-        assert_eq!(event.site, pos);
-        assert_eq!(event.value, expected);
-        assert_eq!(snapshot.value_at(&pos), Some(&event.value));
+    fn crate_reexports_analysis_cache() {
+        let cache = AnalysisCache::new();
+        assert!(cache.is_empty());
     }
 
     #[test]
-    fn crate_reexports_compile_cache() {
-        let cache = CompileCache::new();
-        assert!(cache.is_empty());
+    fn crate_reexports_graph_as_live_document_shape() {
+        let graph = Graph {
+            nodes: BTreeMap::new(),
+            edges: BTreeMap::new(),
+            name: "live".into(),
+            cols: 4,
+            rows: 2,
+        };
+
+        assert_eq!(graph.name, "live");
+        assert_eq!(graph.cols, 4);
+        assert_eq!(graph.rows, 2);
+    }
+
+    #[test]
+    fn readme_avoids_removed_lowering_api_names() {
+        let readme = include_str!("../README.md");
+        for needle in [
+            "compile",
+            "render_terminals",
+            "Backend",
+            "Expr",
+            "JsBackend",
+            "LuaBackend",
+            "GraphEngine",
+            "HostAdapter",
+        ] {
+            assert!(
+                !readme.contains(needle),
+                "README.md still contains stale lowering reference: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn agents_reference_avoids_removed_lowering_api_names() {
+        let agents = include_str!("../AGENTS.md");
+        for needle in [
+            "compile",
+            "render_terminals",
+            "Backend",
+            "Expr",
+            "JsBackend",
+            "LuaBackend",
+            "GraphEngine",
+            "HostAdapter",
+        ] {
+            assert!(
+                !agents.contains(needle),
+                "AGENTS.md still contains stale lowering reference: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn docs_avoid_removed_activity_api_names() {
+        let readme = include_str!("../README.md");
+        let agents = include_str!("../AGENTS.md");
+
+        for needle in [
+            "preview_timeline",
+            "preview_timelines",
+            "build_activity_snapshot",
+            "build_probe_snapshot",
+            "PreviewTimeline",
+            "ActivitySnapshot",
+            "ProbeSnapshot",
+            "HostTime",
+        ] {
+            assert!(
+                !readme.contains(needle),
+                "README.md still contains removed activity API reference: {needle}"
+            );
+            assert!(
+                !agents.contains(needle),
+                "AGENTS.md still contains removed activity API reference: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_ops_and_subgraph_modules_do_not_call_public_semantic_pass() {
+        for (path, source) in [
+            ("ops/validation.rs", include_str!("ops/validation.rs")),
+            ("ops/pruning.rs", include_str!("ops/pruning.rs")),
+            ("subgraph/analysis.rs", include_str!("subgraph/analysis.rs")),
+        ] {
+            assert!(
+                !source.contains("use crate::semantic::semantic_pass"),
+                "{path} still imports the public semantic_pass wrapper",
+            );
+            assert!(
+                !source.contains("semantic_pass("),
+                "{path} still calls the public semantic_pass wrapper",
+            );
+        }
     }
 }

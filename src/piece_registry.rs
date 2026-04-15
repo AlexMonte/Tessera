@@ -1,10 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::piece::{Piece, PieceDef};
 
 pub struct PieceRegistry {
     pieces: BTreeMap<String, Arc<dyn Piece>>,
+    duplicate_piece_ids: BTreeSet<String>,
 }
 
 impl Default for PieceRegistry {
@@ -17,17 +18,22 @@ impl PieceRegistry {
     pub fn new() -> Self {
         Self {
             pieces: BTreeMap::new(),
+            duplicate_piece_ids: BTreeSet::new(),
         }
     }
 
     pub fn register(&mut self, piece: impl Piece + 'static) {
         let id = piece.def().id.clone();
-        self.pieces.insert(id, Arc::new(piece));
+        if self.pieces.insert(id.clone(), Arc::new(piece)).is_some() {
+            self.duplicate_piece_ids.insert(id);
+        }
     }
 
     /// Register a pre-wrapped `Arc<dyn Piece>` with an explicit id.
     pub fn register_arc(&mut self, id: String, piece: Arc<dyn Piece>) {
-        self.pieces.insert(id, piece);
+        if self.pieces.insert(id.clone(), piece).is_some() {
+            self.duplicate_piece_ids.insert(id);
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<dyn Piece>> {
@@ -75,17 +81,16 @@ impl PieceRegistry {
             })
             .collect()
     }
+
+    pub(crate) fn duplicate_piece_ids(&self) -> impl Iterator<Item = &String> {
+        self.duplicate_piece_ids.iter()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use serde_json::Value;
-
     use super::PieceRegistry;
-    use crate::ast::Expr;
-    use crate::piece::{Piece, PieceDef, PieceInputs};
+    use crate::piece::{Piece, PieceDef};
     use crate::types::{PieceCategory, PieceSemanticKind, TileSide};
 
     struct TestPiece {
@@ -95,10 +100,6 @@ mod tests {
     impl Piece for TestPiece {
         fn def(&self) -> &PieceDef {
             &self.def
-        }
-
-        fn compile(&self, _inputs: &PieceInputs, _inline_params: &BTreeMap<String, Value>) -> Expr {
-            Expr::nil()
         }
     }
 
@@ -115,6 +116,7 @@ mod tests {
                 params: vec![],
                 output_type: Some("bool".into()),
                 output_side: Some(TileSide::RIGHT),
+                output_role: Default::default(),
                 description: None,
                 tags: vec!["logic".into(), "boolean".into()],
             },
@@ -129,6 +131,7 @@ mod tests {
                 params: vec![],
                 output_type: Some("pattern".into()),
                 output_side: Some(TileSide::RIGHT),
+                output_role: Default::default(),
                 description: None,
                 tags: vec!["math".into()],
             },
@@ -143,6 +146,7 @@ mod tests {
                 params: vec![],
                 output_type: Some("any".into()),
                 output_side: Some(TileSide::RIGHT),
+                output_role: Default::default(),
                 description: None,
                 tags: vec!["math".into(), "favorite".into()],
             },
@@ -176,6 +180,7 @@ mod tests {
                 params: vec![],
                 output_type: Some("bool".into()),
                 output_side: Some(TileSide::RIGHT),
+                output_role: Default::default(),
                 description: None,
                 tags: vec!["logic".into(), "boolean".into()],
             },
@@ -190,6 +195,7 @@ mod tests {
                 params: vec![],
                 output_type: Some("pattern".into()),
                 output_side: Some(TileSide::RIGHT),
+                output_role: Default::default(),
                 description: None,
                 tags: vec!["timing".into()],
             },
@@ -216,6 +222,7 @@ mod tests {
                 params: vec![],
                 output_type: Some("bool".into()),
                 output_side: Some(TileSide::RIGHT),
+                output_role: Default::default(),
                 description: None,
                 tags: vec!["logic".into()],
             },
@@ -230,6 +237,7 @@ mod tests {
                 params: vec![],
                 output_type: Some("pattern".into()),
                 output_side: Some(TileSide::RIGHT),
+                output_role: Default::default(),
                 description: None,
                 tags: vec!["logic".into()],
             },
@@ -244,6 +252,7 @@ mod tests {
                 params: vec![],
                 output_type: Some("any".into()),
                 output_side: Some(TileSide::RIGHT),
+                output_role: Default::default(),
                 description: None,
                 tags: vec!["logic".into()],
             },

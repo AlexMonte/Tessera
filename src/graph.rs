@@ -6,22 +6,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::diagnostics::{Diagnostic, DiagnosticKind};
+use crate::internal::{
+    duplicate_effective_input_sides, registry_sanity_diagnostics, validate_graph_edge_structure,
+};
 use crate::piece_registry::PieceRegistry;
 use crate::types::{EdgeId, GridPos, TileSide};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// One placed piece instance on the grid.
 pub struct Node {
-    /// Registered piece id, for example `strudel.fast`.
+    /// Registered piece id, for example `host.filter`.
     pub piece_id: String,
     /// Inline parameter values owned directly by this node instance.
     #[serde(default)]
     pub inline_params: BTreeMap<String, Value>,
     /// Per-param side assignments applied to this placed node.
-    ///
-    /// Missing entries mean the param is currently unassigned. Legacy `null`
-    /// entries deserialize as missing assignments.
-    #[serde(default, deserialize_with = "input_sides_serde::deserialize")]
+    #[serde(default)]
     pub input_sides: BTreeMap<String, TileSide>,
     /// Optional output-side override applied by the editor.
     #[serde(default)]
@@ -54,10 +54,10 @@ pub struct Graph {
     /// Display name for the graph/workspace.
     #[serde(default)]
     pub name: String,
-    /// Grid width in columns. Defaults to 9.
+    /// Grid width in columns. Defaults to 14.
     #[serde(default = "default_grid_cols")]
     pub cols: u32,
-    /// Grid height in rows. Defaults to 9.
+    /// Grid height in rows. Defaults to 6.
     #[serde(default = "default_grid_rows")]
     pub rows: u32,
 }
@@ -71,7 +71,7 @@ fn default_grid_rows() -> u32 {
 
 impl Graph {
     pub fn validate(&self, registry: &PieceRegistry) -> Vec<Diagnostic> {
-        let mut diagnostics = Vec::<Diagnostic>::new();
+        let mut diagnostics = registry_sanity_diagnostics(registry);
 
         for (pos, node) in &self.nodes {
             if registry.get(node.piece_id.as_str()).is_none() {
@@ -96,66 +96,7 @@ impl Graph {
             }
         }
 
-        let mut incoming_slots = BTreeSet::<(GridPos, String)>::new();
-        for edge in self.edges.values() {
-            let Some(from_node) = self.nodes.get(&edge.from) else {
-                diagnostics.push(
-                    Diagnostic::error(
-                        DiagnosticKind::UnknownNode { pos: edge.from },
-                        Some(edge.to_node),
-                    )
-                    .with_edge(edge.id.clone()),
-                );
-                continue;
-            };
-            let Some(to_node) = self.nodes.get(&edge.to_node) else {
-                diagnostics.push(
-                    Diagnostic::error(
-                        DiagnosticKind::UnknownNode { pos: edge.to_node },
-                        Some(edge.to_node),
-                    )
-                    .with_edge(edge.id.clone()),
-                );
-                continue;
-            };
-            if registry.get(from_node.piece_id.as_str()).is_none() {
-                continue;
-            }
-            let Some(to_piece) = registry.get(to_node.piece_id.as_str()) else {
-                continue;
-            };
-
-            if !incoming_slots.insert((edge.to_node, edge.to_param.clone())) {
-                diagnostics.push(
-                    Diagnostic::error(
-                        DiagnosticKind::DuplicateConnection {
-                            to_node: edge.to_node,
-                            to_param: edge.to_param.clone(),
-                        },
-                        Some(edge.to_node),
-                    )
-                    .with_edge(edge.id.clone()),
-                );
-            }
-
-            if !to_piece
-                .def()
-                .params
-                .iter()
-                .any(|param| param.id == edge.to_param)
-            {
-                diagnostics.push(
-                    Diagnostic::error(
-                        DiagnosticKind::UnknownParam {
-                            piece_id: to_piece.def().id.clone(),
-                            param: edge.to_param.clone(),
-                        },
-                        Some(edge.to_node),
-                    )
-                    .with_edge(edge.id.clone()),
-                );
-            }
-        }
+        validate_graph_edge_structure(self, registry, &mut diagnostics);
 
         for (pos, node) in &self.nodes {
             let Some(piece) = registry.get(node.piece_id.as_str()) else {
@@ -189,6 +130,13 @@ impl Graph {
                         piece_id: piece.def().id.clone(),
                         param: side_key.clone(),
                     },
+                    Some(*pos),
+                ));
+            }
+
+            for (side, params) in duplicate_effective_input_sides(node, piece.def()) {
+                diagnostics.push(Diagnostic::error(
+                    DiagnosticKind::DuplicateInputSide { side, params },
                     Some(*pos),
                 ));
             }
@@ -360,54 +308,11 @@ mod grid_nodes_serde {
     }
 }
 
-mod input_sides_serde {
-    use crate::types::TileSide;
-    use serde::Deserialize;
-    use serde::Deserializer;
-    use std::collections::BTreeMap;
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<String, TileSide>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let raw = BTreeMap::<String, Option<TileSide>>::deserialize(deserializer)?;
-        Ok(raw
-            .into_iter()
-            .filter_map(|(param, side)| side.map(|side| (param, side)))
-            .collect())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-/// Legacy standalone project document retained for schema-v2 migration.
-pub struct ProjectDocument {
-    pub schema_version: u32,
-    pub name: String,
-    pub graph: Graph,
-}
-
-impl ProjectDocument {
-    /// Schema version used by the legacy document wrapper.
-    pub const SCHEMA_VERSION: u32 = 2;
-
-    /// Build a legacy project wrapper around a graph.
-    pub fn new(name: String, graph: Graph) -> Self {
-        Self {
-            schema_version: Self::SCHEMA_VERSION,
-            name,
-            graph,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{Edge, Graph, GraphOp, Node};
-    use crate::ast::Expr;
     use crate::diagnostics::DiagnosticKind;
-    use crate::piece::{
-        ParamDef, ParamInlineMode, ParamSchema, ParamValueKind, Piece, PieceDef, PieceInputs,
-    };
+    use crate::piece::{ParamDef, ParamInlineMode, ParamSchema, ParamValueKind, Piece, PieceDef};
     use crate::piece_registry::PieceRegistry;
     use crate::types::{EdgeId, GridPos, PieceCategory, PieceSemanticKind, PortType, TileSide};
     use serde_json::Value;
@@ -415,8 +320,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn node_input_sides_drop_legacy_null_entries() {
-        let node: Node = serde_json::from_value(json!({
+    fn node_input_sides_reject_null_entries() {
+        let error = serde_json::from_value::<Node>(json!({
             "piece_id": "test.node",
             "inline_params": {},
             "input_sides": {
@@ -427,12 +332,9 @@ mod tests {
             "label": null,
             "node_state": null
         }))
-        .expect("deserialize node");
+        .expect_err("legacy null entries should be rejected");
 
-        assert_eq!(
-            node.input_sides,
-            BTreeMap::from([("left".into(), TileSide::LEFT)])
-        );
+        assert!(error.to_string().contains("invalid type"));
     }
 
     #[test]
@@ -463,6 +365,7 @@ mod tests {
                     params: vec![],
                     output_type: Some(PortType::new("pattern")),
                     output_side: Some(TileSide::RIGHT),
+                    output_role: Default::default(),
                     description: None,
                     tags: vec![],
                 },
@@ -493,9 +396,11 @@ mod tests {
                         text_semantics: Default::default(),
                         variadic_group: None,
                         required: true,
+                        role: Default::default(),
                     }],
                     output_type: None,
                     output_side: None,
+                    output_role: Default::default(),
                     description: None,
                     tags: vec![],
                 },
@@ -506,10 +411,6 @@ mod tests {
     impl Piece for TestPiece {
         fn def(&self) -> &PieceDef {
             &self.def
-        }
-
-        fn compile(&self, _inputs: &PieceInputs, _inline_params: &BTreeMap<String, Value>) -> Expr {
-            Expr::nil()
         }
     }
 
