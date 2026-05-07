@@ -18,6 +18,7 @@ struct NodeOutputKey {
 
 type NodeOutputs = BTreeMap<OutputEndpoint, PatternStream>;
 
+#[allow(dead_code)]
 pub fn compile_program(program: &TesseraProgram) -> Result<PatternIr, Vec<Diagnostic>> {
     validate_program_shape(program)?;
     let normalized = normalize_program(program)?;
@@ -52,6 +53,7 @@ pub fn compile_normalized_program(program: &NormalizedProgram) -> Result<Pattern
     Ok(PatternIr { outputs })
 }
 
+#[allow(dead_code)]
 pub fn compile_container_preview(
     program: &TesseraProgram,
     container_id: crate::domain::ContainerId,

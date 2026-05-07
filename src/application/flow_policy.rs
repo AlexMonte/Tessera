@@ -9,6 +9,7 @@ use crate::domain::{
 pub type NodeInputs = BTreeMap<InputEndpoint, Vec<PatternStream>>;
 pub type NodeOutputs = BTreeMap<OutputEndpoint, PatternStream>;
 
+#[allow(dead_code)]
 pub fn flow_policy_contract_table() -> Vec<(&'static str, &'static str)> {
     vec![
         ("layer", "Deterministic compile-time layering of all input streams."),

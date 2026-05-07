@@ -1,18 +1,17 @@
 //! Tessera: a spatial music-pattern language.
 //!
-//! The hard-cut crate shape is:
-//! - `domain`: language model, invariants, diagnostics, and IR contracts
-//! - `application`: compiler/use-case functions built on top of the domain
+//! Public usage should go through `infrastructure`.
+//!
+//! Module boundaries:
+//! - `domain`: language model and contracts
+//! - `application`: internal use-case machinery
+//! - `infrastructure`: user-facing API facade
 
-pub mod application;
+mod application;
 pub mod domain;
+pub mod infrastructure;
 
 pub mod prelude {
-    pub use crate::application::{
-        compile_container, compile_container_preview, compile_normalized_program, compile_program,
-        infer_normalized_container_shape, normalize_container, normalize_program,
-        validate_program, validate_program_shape,
-    };
     pub use crate::domain::{
         AtomExpr, AtomExprKind, AtomModifier, AtomOperatorToken, AtomTile, Container,
         ContainerId, ContainerKind, ContainerSurfaceTile, CycleDuration, CycleSpan, CycleTime,
@@ -25,22 +24,21 @@ pub mod prelude {
         PortGroupId, PortMemberId, Rational, RootRelation, RootSurfaceNodeKind, ScalarAtom, Side,
         StreamShape, StreamSource, StreamTarget, TesseraProgram, TransformKind, TransformNode,
     };
+    pub use crate::infrastructure::{
+        CompileOptions, CompileReport, PreviewReport, TesseraCompiler, ValidationReport,
+    };
 }
 
-pub use application::{
-    compile_container, compile_container_preview, compile_normalized_program, compile_program,
-    infer_normalized_container_shape, normalize_container, normalize_program, validate_program,
-    validate_program_shape,
+pub use infrastructure::{
+    CompileOptions, CompileReport, PreviewReport, TesseraCompiler, ValidationReport,
 };
-pub use domain::*;
 
 #[cfg(test)]
 mod tests {
-    use crate::application::compile_program;
-    use crate::domain::{
+    use crate::prelude::{
         AtomOperatorToken, AtomTile, Container, ContainerId, ContainerKind, ContainerSurfaceTile,
-        EventValue, InputEndpoint, InputPort, NodeId, NoteAtom, OutputNode, PortGroupId,
-        PortMemberId, Rational, RootRelation, RootSurfaceNodeKind, ScalarAtom, TesseraProgram,
+        EventValue, InputEndpoint, InputPort, NodeId, NoteAtom, OutputNode, PortGroupId, PortMemberId,
+        Rational, RootRelation, RootSurfaceNodeKind, ScalarAtom, TesseraCompiler, TesseraProgram,
         TransformKind, TransformNode, StreamSource, StreamTarget,
     };
     use std::collections::BTreeMap;
@@ -119,17 +117,19 @@ mod tests {
             ],
         };
 
-        let ir = compile_program(&program).expect("program should compile");
-        assert_eq!(ir.outputs.len(), 1);
-        assert_eq!(ir.outputs[0].id, NodeId::new("out"));
-        assert_eq!(ir.outputs[0].events.len(), 1);
-        match &ir.outputs[0].events[0].value {
+        let report = TesseraCompiler::new()
+            .compile(&program)
+            .expect("program should compile");
+        assert_eq!(report.ir.outputs.len(), 1);
+        assert_eq!(report.ir.outputs[0].id, NodeId::new("out"));
+        assert_eq!(report.ir.outputs[0].events.len(), 1);
+        match &report.ir.outputs[0].events[0].value {
             EventValue::Note { value, octave } => {
                 assert_eq!(value, "a");
                 assert_eq!(*octave, None);
             }
             value => panic!("unexpected event value: {value:?}"),
         }
-        assert_eq!(ir.outputs[0].events[0].span.duration.0, Rational::from_integer(2));
+        assert_eq!(report.ir.outputs[0].events[0].span.duration.0, Rational::from_integer(2));
     }
 }
