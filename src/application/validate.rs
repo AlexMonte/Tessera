@@ -24,6 +24,7 @@ pub fn validate_program_shape(program: &TesseraProgram) -> Result<(), Vec<Diagno
     }
 }
 
+#[allow(dead_code)]
 pub fn validate_program(program: &TesseraProgram) -> Result<(), Vec<Diagnostic>> {
     validate_program_shape(program)
 }

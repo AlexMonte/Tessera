@@ -1,14 +1,14 @@
 use std::collections::BTreeMap;
 
-use tessera::{
-    AtomExprKind, AtomModifier, AtomOperatorToken, AtomTile, Container, ContainerId, ContainerKind,
-    ContainerSurfaceTile, ConnectionRule, DefaultStreamBehavior, DiagnosticKind, DiagnosticLocation, EventField, FieldValue,
-    FlowControlKind, FlowControlNode, FlowControlPolicy, InputEndpoint, InputPort, NodeId, NoteAtom,
-    NodeInputRole, NodeSignature, OutputEndpoint, OutputNode, PortCountRule,
-    PortGroupId, PortMemberId, Rational, RootRelation, RootSurfaceNodeKind, ScalarAtom, StreamShape,
-    StreamSource, StreamTarget, TesseraProgram, TransformKind, TransformNode, compile_normalized_program,
-    compile_program, infer_normalized_container_shape, normalize_container, normalize_program,
-    validate_program_shape,
+use tessera::prelude::{
+    AtomExprKind, AtomModifier, AtomOperatorToken, AtomTile, ConnectionRule, Container,
+    ContainerId, ContainerKind, ContainerSurfaceTile, DefaultStreamBehavior, DiagnosticKind,
+    DiagnosticLocation, EventField, EventValue, FieldValue, FlowControlKind, FlowControlNode,
+    FlowControlPolicy, GroupMembers, InputEndpoint, InputGroupSpec, InputPort, InputSocketSpec,
+    MusicalValue, NodeId, NodeInputRole, NodeSignature, NoteAtom, OutputEndpoint, OutputNode,
+    PortCountRule, PortGroupId, PortMemberId, Rational, RootRelation, RootSurfaceNodeKind,
+    ScalarAtom, StreamShape, StreamSource, StreamTarget, TesseraCompiler, TesseraProgram,
+    TransformKind, TransformNode,
 };
 
 fn output_input(member: &str) -> InputEndpoint {
@@ -29,13 +29,18 @@ fn transform_without_main_input_is_rejected() {
         NodeId::new("slow"),
         RootSurfaceNodeKind::Transform(TransformNode::new(TransformKind::Slow)),
     );
-    let diagnostics = validate_program_shape(&TesseraProgram {
-        root_nodes,
-        containers: BTreeMap::new(),
-        relations: vec![],
-    })
-    .expect_err("transform without main input should be invalid");
-    assert!(diagnostics.iter().any(|d| d.kind == DiagnosticKind::TransformMissingMainInput));
+    let diagnostics = TesseraCompiler::new()
+        .validate(&TesseraProgram {
+            root_nodes,
+            containers: BTreeMap::new(),
+            relations: vec![],
+        })
+        .diagnostics;
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::TransformMissingMainInput)
+    );
 }
 
 #[test]
@@ -47,7 +52,7 @@ fn invalid_port_count_range_is_rejected() {
 fn node_signature_rejects_duplicate_socket_ids() {
     let signature = NodeSignature::new(
         vec![
-            tessera::InputSocketSpec {
+            InputSocketSpec {
                 port: InputPort::new("main"),
                 role: NodeInputRole::Main,
                 shape: StreamShape::EventPattern,
@@ -55,7 +60,7 @@ fn node_signature_rejects_duplicate_socket_ids() {
                 side: None,
                 default: None,
             },
-            tessera::InputSocketSpec {
+            InputSocketSpec {
                 port: InputPort::new("main"),
                 role: NodeInputRole::Aux,
                 shape: StreamShape::ScalarPattern,
@@ -75,7 +80,7 @@ fn node_signature_rejects_duplicate_socket_ids() {
 #[test]
 fn node_signature_rejects_invalid_default_stream_shape() {
     let signature = NodeSignature::new(
-        vec![tessera::InputSocketSpec {
+        vec![InputSocketSpec {
             port: InputPort::new("main"),
             role: NodeInputRole::Main,
             shape: StreamShape::EventPattern,
@@ -95,7 +100,7 @@ fn node_signature_rejects_invalid_default_stream_shape() {
 
 #[test]
 fn group_members_reject_duplicate_members() {
-    let mut members = tessera::GroupMembers::default();
+    let mut members = GroupMembers::default();
     members.outputs.insert(
         PortGroupId::new("branches"),
         vec![PortMemberId::new("high"), PortMemberId::new("high")],
@@ -107,7 +112,7 @@ fn group_members_reject_duplicate_members() {
 #[test]
 fn node_signature_rejects_socket_group_name_collision() {
     let result = NodeSignature::new(
-        vec![tessera::InputSocketSpec {
+        vec![InputSocketSpec {
             port: InputPort::new("streams"),
             role: NodeInputRole::Main,
             shape: StreamShape::EventPattern,
@@ -115,7 +120,7 @@ fn node_signature_rejects_socket_group_name_collision() {
             side: None,
             default: None,
         }],
-        vec![tessera::InputGroupSpec {
+        vec![InputGroupSpec {
             group: PortGroupId::new("streams"),
             role: NodeInputRole::Main,
             shape: StreamShape::EventPattern,
@@ -141,14 +146,20 @@ fn note_adjacent_scalar_binds_absolute_octave() {
         },
     );
 
-    let normalized = normalize_container(
-        &TesseraProgram { root_nodes: BTreeMap::new(), containers, relations: vec![] },
-        &ContainerId::new("phrase"),
-    )
-    .expect("container should normalize");
+    let normalized = TesseraCompiler::new()
+        .normalize(&TesseraProgram {
+            root_nodes: BTreeMap::new(),
+            containers,
+            relations: vec![],
+        })
+        .expect("program should normalize");
+    let normalized = normalized
+        .containers
+        .get(&ContainerId::new("phrase"))
+        .expect("container should exist");
 
     match &normalized.exprs[0].kind {
-        AtomExprKind::Value(tessera::MusicalValue::Note(note)) => {
+        AtomExprKind::Value(MusicalValue::Note(note)) => {
             assert_eq!(note.value, "e".into());
             assert_eq!(note.octave, Some(3));
         }
@@ -171,13 +182,19 @@ fn multiple_adjacent_scalars_after_note_are_ambiguous() {
         },
     );
 
-    let diagnostics = normalize_container(
-        &TesseraProgram { root_nodes: BTreeMap::new(), containers, relations: vec![] },
-        &ContainerId::new("phrase"),
-    )
-    .expect_err("ambiguous octave binding should fail");
+    let diagnostics = TesseraCompiler::new()
+        .normalize(&TesseraProgram {
+            root_nodes: BTreeMap::new(),
+            containers,
+            relations: vec![],
+        })
+        .expect_err("ambiguous octave binding should fail");
 
-    assert!(diagnostics.iter().any(|d| d.kind == DiagnosticKind::AmbiguousOctaveBinding));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::AmbiguousOctaveBinding)
+    );
 }
 
 #[test]
@@ -187,7 +204,9 @@ fn normalization_preserves_nested_ids_and_broad_modifiers() {
         ContainerId::new("child"),
         Container {
             kind: ContainerKind::Sequence,
-            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new("x")))],
+            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new(
+                "x",
+            )))],
         },
     );
     containers.insert(
@@ -206,15 +225,27 @@ fn normalization_preserves_nested_ids_and_broad_modifiers() {
         },
     );
 
-    let normalized = normalize_container(
-        &TesseraProgram { root_nodes: BTreeMap::new(), containers, relations: vec![] },
-        &ContainerId::new("parent"),
-    )
-    .expect("container should normalize");
+    let normalized = TesseraCompiler::new()
+        .normalize(&TesseraProgram {
+            root_nodes: BTreeMap::new(),
+            containers,
+            relations: vec![],
+        })
+        .expect("program should normalize");
+    let normalized = normalized
+        .containers
+        .get(&ContainerId::new("parent"))
+        .expect("container should exist");
 
     match &normalized.exprs[0].kind {
         AtomExprKind::Choice(branches) => {
-            assert_eq!(branches[0].modifiers, vec![AtomModifier::Fast(Rational::from_integer(2)), AtomModifier::Replicate(3)]);
+            assert_eq!(
+                branches[0].modifiers,
+                vec![
+                    AtomModifier::Fast(Rational::from_integer(2)),
+                    AtomModifier::Replicate(3)
+                ]
+            );
         }
         value => panic!("unexpected normalized kind: {value:?}"),
     }
@@ -228,23 +259,41 @@ fn scalar_only_stream_is_rejected_by_default_output() {
         ContainerId::new("control"),
         Container {
             kind: ContainerKind::Sequence,
-            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Scalar(ScalarAtom::integer(2)))],
+            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Scalar(
+                ScalarAtom::integer(2),
+            ))],
         },
     );
-    root_nodes.insert(NodeId::new("control"), RootSurfaceNodeKind::Container { container: ContainerId::new("control") });
-    root_nodes.insert(NodeId::new("out"), RootSurfaceNodeKind::Output(OutputNode::default()));
+    root_nodes.insert(
+        NodeId::new("control"),
+        RootSurfaceNodeKind::Container {
+            container: ContainerId::new("control"),
+        },
+    );
+    root_nodes.insert(
+        NodeId::new("out"),
+        RootSurfaceNodeKind::Output(OutputNode::default()),
+    );
 
-    let diagnostics = validate_program_shape(&TesseraProgram {
-        root_nodes,
-        containers,
-        relations: vec![RootRelation::FlowsTo {
-            from: StreamSource::node(NodeId::new("control")),
-            to: StreamTarget::OutputInput { node: NodeId::new("out"), endpoint: output_input("main") },
-        }],
-    })
-    .expect_err("scalar-only stream should not feed default musical output");
+    let diagnostics = TesseraCompiler::new()
+        .validate(&TesseraProgram {
+            root_nodes,
+            containers,
+            relations: vec![RootRelation::FlowsTo {
+                from: StreamSource::node(NodeId::new("control")),
+                to: StreamTarget::OutputInput {
+                    node: NodeId::new("out"),
+                    endpoint: output_input("main"),
+                },
+            }],
+        })
+        .diagnostics;
 
-    assert!(diagnostics.iter().any(|d| d.kind == DiagnosticKind::InvalidStreamShape));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::InvalidStreamShape)
+    );
 }
 
 #[test]
@@ -254,14 +303,18 @@ fn normalized_shape_inference_tracks_scalar_nested_choice_and_parallel_container
         ContainerId::new("scalar_child"),
         Container {
             kind: ContainerKind::Sequence,
-            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Scalar(ScalarAtom::integer(2)))],
+            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Scalar(
+                ScalarAtom::integer(2),
+            ))],
         },
     );
     containers.insert(
         ContainerId::new("nested_scalar"),
         Container {
             kind: ContainerKind::Sequence,
-            stack: vec![ContainerSurfaceTile::NestedContainer(ContainerId::new("scalar_child"))],
+            stack: vec![ContainerSurfaceTile::NestedContainer(ContainerId::new(
+                "scalar_child",
+            ))],
         },
     );
     containers.insert(
@@ -287,22 +340,39 @@ fn normalized_shape_inference_tracks_scalar_nested_choice_and_parallel_container
         },
     );
 
-    let normalized = normalize_program(&TesseraProgram {
-        root_nodes: BTreeMap::new(),
-        containers,
-        relations: vec![],
-    })
-    .expect("program should normalize");
+    let normalized = TesseraCompiler::new()
+        .normalize(&TesseraProgram {
+            root_nodes: BTreeMap::new(),
+            containers,
+            relations: vec![],
+        })
+        .expect("program should normalize");
 
-    for id in ["scalar_child", "nested_scalar", "choice_scalar", "parallel_scalar"] {
-        let shape = infer_normalized_container_shape(
-            &normalized,
-            normalized
-                .containers
-                .get(&ContainerId::new(id))
-                .expect("container should exist"),
-        );
-        assert_eq!(shape, StreamShape::ScalarPattern, "{id} should infer as scalar");
+    for id in [
+        "scalar_child",
+        "nested_scalar",
+        "choice_scalar",
+        "parallel_scalar",
+    ] {
+        let container = normalized
+            .containers
+            .get(&ContainerId::new(id))
+            .expect("container should exist");
+        match id {
+            "scalar_child" => assert!(matches!(
+                container.exprs[0].kind,
+                AtomExprKind::Value(MusicalValue::Scalar(_))
+            )),
+            "nested_scalar" => assert!(matches!(
+                container.exprs[0].kind,
+                AtomExprKind::Value(MusicalValue::NestedContainer(_))
+            )),
+            "choice_scalar" => assert!(matches!(container.exprs[0].kind, AtomExprKind::Choice(_))),
+            "parallel_scalar" => {
+                assert!(matches!(container.exprs[0].kind, AtomExprKind::Parallel(_)))
+            }
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -310,21 +380,51 @@ fn normalized_shape_inference_tracks_scalar_nested_choice_and_parallel_container
 fn compile_program_supports_aux_stream_modulation_and_output_collection() {
     let mut root_nodes = BTreeMap::new();
     let mut containers = BTreeMap::new();
-    for (id, tile) in [("main", AtomTile::Note(NoteAtom::new("a"))), ("after", AtomTile::Note(NoteAtom::new("b")))] {
+    for (id, tile) in [
+        ("main", AtomTile::Note(NoteAtom::new("a"))),
+        ("after", AtomTile::Note(NoteAtom::new("b"))),
+    ] {
         containers.insert(
             ContainerId::new(id),
-            Container { kind: ContainerKind::Sequence, stack: vec![ContainerSurfaceTile::Atom(tile)] },
+            Container {
+                kind: ContainerKind::Sequence,
+                stack: vec![ContainerSurfaceTile::Atom(tile)],
+            },
         );
-        root_nodes.insert(NodeId::new(id), RootSurfaceNodeKind::Container { container: ContainerId::new(id) });
+        root_nodes.insert(
+            NodeId::new(id),
+            RootSurfaceNodeKind::Container {
+                container: ContainerId::new(id),
+            },
+        );
     }
     containers.insert(
         ContainerId::new("mod"),
-        Container { kind: ContainerKind::Sequence, stack: vec![ContainerSurfaceTile::Atom(AtomTile::Scalar(ScalarAtom::integer(4)))] },
+        Container {
+            kind: ContainerKind::Sequence,
+            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Scalar(
+                ScalarAtom::integer(4),
+            ))],
+        },
     );
-    root_nodes.insert(NodeId::new("mod"), RootSurfaceNodeKind::Container { container: ContainerId::new("mod") });
-    root_nodes.insert(NodeId::new("slow"), RootSurfaceNodeKind::Transform(TransformNode::new(TransformKind::Slow)));
-    root_nodes.insert(NodeId::new("gain"), RootSurfaceNodeKind::Transform(TransformNode::new(TransformKind::Gain)));
-    root_nodes.insert(NodeId::new("out"), RootSurfaceNodeKind::Output(OutputNode::default()));
+    root_nodes.insert(
+        NodeId::new("mod"),
+        RootSurfaceNodeKind::Container {
+            container: ContainerId::new("mod"),
+        },
+    );
+    root_nodes.insert(
+        NodeId::new("slow"),
+        RootSurfaceNodeKind::Transform(TransformNode::new(TransformKind::Slow)),
+    );
+    root_nodes.insert(
+        NodeId::new("gain"),
+        RootSurfaceNodeKind::Transform(TransformNode::new(TransformKind::Gain)),
+    );
+    root_nodes.insert(
+        NodeId::new("out"),
+        RootSurfaceNodeKind::Output(OutputNode::default()),
+    );
 
     let program = TesseraProgram {
         root_nodes,
@@ -332,11 +432,17 @@ fn compile_program_supports_aux_stream_modulation_and_output_collection() {
         relations: vec![
             RootRelation::FlowsTo {
                 from: StreamSource::node(NodeId::new("main")),
-                to: StreamTarget::TransformInput { node: NodeId::new("slow"), endpoint: transform_input("main") },
+                to: StreamTarget::TransformInput {
+                    node: NodeId::new("slow"),
+                    endpoint: transform_input("main"),
+                },
             },
             RootRelation::FlowsTo {
                 from: StreamSource::node(NodeId::new("mod")),
-                to: StreamTarget::TransformInput { node: NodeId::new("slow"), endpoint: transform_input("factor") },
+                to: StreamTarget::TransformInput {
+                    node: NodeId::new("slow"),
+                    endpoint: transform_input("factor"),
+                },
             },
             RootRelation::ChainedTo {
                 from: StreamSource::node(NodeId::new("slow")),
@@ -344,27 +450,55 @@ fn compile_program_supports_aux_stream_modulation_and_output_collection() {
             },
             RootRelation::FlowsTo {
                 from: StreamSource::node(NodeId::new("after")),
-                to: StreamTarget::TransformInput { node: NodeId::new("gain"), endpoint: transform_input("main") },
+                to: StreamTarget::TransformInput {
+                    node: NodeId::new("gain"),
+                    endpoint: transform_input("main"),
+                },
             },
             RootRelation::FlowsTo {
                 from: StreamSource::node(NodeId::new("mod")),
-                to: StreamTarget::TransformInput { node: NodeId::new("gain"), endpoint: transform_input("amount") },
+                to: StreamTarget::TransformInput {
+                    node: NodeId::new("gain"),
+                    endpoint: transform_input("amount"),
+                },
             },
             RootRelation::FlowsTo {
                 from: StreamSource::node(NodeId::new("gain")),
-                to: StreamTarget::OutputInput { node: NodeId::new("out"), endpoint: output_input("gain") },
+                to: StreamTarget::OutputInput {
+                    node: NodeId::new("out"),
+                    endpoint: output_input("gain"),
+                },
             },
             RootRelation::FlowsTo {
                 from: StreamSource::node(NodeId::new("main")),
-                to: StreamTarget::OutputInput { node: NodeId::new("out"), endpoint: output_input("dry") },
+                to: StreamTarget::OutputInput {
+                    node: NodeId::new("out"),
+                    endpoint: output_input("dry"),
+                },
             },
         ],
     };
 
-    let ir = compile_program(&program).expect("program should compile");
+    let ir = TesseraCompiler::new()
+        .compile_ir(&program)
+        .expect("program should compile");
     assert_eq!(ir.outputs[0].events.len(), 3);
-    assert!(ir.outputs[0].events.iter().any(|event| event.span.duration.0 == Rational::from_integer(4)));
-    assert!(ir.outputs[0].events.iter().any(|event| event.fields.contains(&EventField::Gain(FieldValue::Rational { value: Rational::from_integer(4) }))));
+    assert!(
+        ir.outputs[0]
+            .events
+            .iter()
+            .any(|event| event.span.duration.0 == Rational::from_integer(4))
+    );
+    assert!(
+        ir.outputs[0]
+            .events
+            .iter()
+            .any(|event| event
+                .fields
+                .contains(&EventField::Gain(FieldValue::Rational {
+                    value: Rational::from_integer(4)
+                })))
+    );
 }
 
 #[test]
@@ -372,14 +506,30 @@ fn diagnostics_carry_locations() {
     let mut containers = BTreeMap::new();
     containers.insert(
         ContainerId::new("bad"),
-        Container { kind: ContainerKind::Sequence, stack: vec![ContainerSurfaceTile::Transform] },
+        Container {
+            kind: ContainerKind::Sequence,
+            stack: vec![ContainerSurfaceTile::Transform],
+        },
     );
     let mut root_nodes = BTreeMap::new();
-    root_nodes.insert(NodeId::new("bad"), RootSurfaceNodeKind::Container { container: ContainerId::new("bad") });
+    root_nodes.insert(
+        NodeId::new("bad"),
+        RootSurfaceNodeKind::Container {
+            container: ContainerId::new("bad"),
+        },
+    );
 
-    let diagnostics = validate_program_shape(&TesseraProgram { root_nodes, containers, relations: vec![] })
-        .expect_err("bad container should produce diagnostics");
-    assert!(diagnostics.iter().any(|diagnostic| matches!(diagnostic.location, Some(DiagnosticLocation::ContainerStack { .. }))));
+    let diagnostics = TesseraCompiler::new()
+        .validate(&TesseraProgram {
+            root_nodes,
+            containers,
+            relations: vec![],
+        })
+        .diagnostics;
+    assert!(diagnostics.iter().any(|diagnostic| matches!(
+        diagnostic.location,
+        Some(DiagnosticLocation::ContainerStack { .. })
+    )));
 }
 
 #[test]
@@ -390,7 +540,9 @@ fn endpoint_diagnostics_name_unknown_input_socket() {
         ContainerId::new("phrase"),
         Container {
             kind: ContainerKind::Sequence,
-            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new("a")))],
+            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new(
+                "a",
+            )))],
         },
     );
     root_nodes.insert(
@@ -404,22 +556,26 @@ fn endpoint_diagnostics_name_unknown_input_socket() {
         RootSurfaceNodeKind::Transform(TransformNode::new(TransformKind::Slow)),
     );
 
-    let diagnostics = validate_program_shape(&TesseraProgram {
-        root_nodes,
-        containers,
-        relations: vec![RootRelation::FlowsTo {
-            from: StreamSource::node(NodeId::new("phrase")),
-            to: StreamTarget::TransformInput {
-                node: NodeId::new("slow"),
-                endpoint: InputEndpoint::Socket(InputPort::new("not-real")),
-            },
-        }],
-    })
-    .expect_err("unknown socket should be rejected");
+    let diagnostics = TesseraCompiler::new()
+        .validate(&TesseraProgram {
+            root_nodes,
+            containers,
+            relations: vec![RootRelation::FlowsTo {
+                from: StreamSource::node(NodeId::new("phrase")),
+                to: StreamTarget::TransformInput {
+                    node: NodeId::new("slow"),
+                    endpoint: InputEndpoint::Socket(InputPort::new("not-real")),
+                },
+            }],
+        })
+        .diagnostics;
 
     assert!(diagnostics.iter().any(|diagnostic| {
         diagnostic.kind == DiagnosticKind::UnknownInputSocket
-            && matches!(diagnostic.location, Some(DiagnosticLocation::InputEndpoint { .. }))
+            && matches!(
+                diagnostic.location,
+                Some(DiagnosticLocation::InputEndpoint { .. })
+            )
     }));
 }
 
@@ -431,7 +587,9 @@ fn unknown_input_group_member_is_rejected() {
         ContainerId::new("phrase"),
         Container {
             kind: ContainerKind::Sequence,
-            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new("a")))],
+            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new(
+                "a",
+            )))],
         },
     );
     root_nodes.insert(
@@ -445,25 +603,28 @@ fn unknown_input_group_member_is_rejected() {
         RootSurfaceNodeKind::FlowControl(FlowControlNode::new(FlowControlKind::Layer)),
     );
 
-    let diagnostics = validate_program_shape(&TesseraProgram {
-        root_nodes,
-        containers,
-        relations: vec![RootRelation::FlowsTo {
-            from: StreamSource::node(NodeId::new("phrase")),
-            to: StreamTarget::FlowControlInput {
-                node: NodeId::new("layer"),
-                endpoint: InputEndpoint::GroupMember {
-                    group: PortGroupId::new("streams"),
-                    member: PortMemberId::new("missing"),
+    let diagnostics = TesseraCompiler::new()
+        .validate(&TesseraProgram {
+            root_nodes,
+            containers,
+            relations: vec![RootRelation::FlowsTo {
+                from: StreamSource::node(NodeId::new("phrase")),
+                to: StreamTarget::FlowControlInput {
+                    node: NodeId::new("layer"),
+                    endpoint: InputEndpoint::GroupMember {
+                        group: PortGroupId::new("streams"),
+                        member: PortMemberId::new("missing"),
+                    },
                 },
-            },
-        }],
-    })
-    .expect_err("unknown input group member should be rejected");
+            }],
+        })
+        .diagnostics;
 
-    assert!(diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.kind == DiagnosticKind::UnknownInputGroupMember));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == DiagnosticKind::UnknownInputGroupMember)
+    );
 }
 
 #[test]
@@ -474,14 +635,18 @@ fn fast_zero_factor_is_diagnostic() {
         ContainerId::new("main"),
         Container {
             kind: ContainerKind::Sequence,
-            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new("a")))],
+            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new(
+                "a",
+            )))],
         },
     );
     containers.insert(
         ContainerId::new("zero"),
         Container {
             kind: ContainerKind::Sequence,
-            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Scalar(ScalarAtom::integer(0)))],
+            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Scalar(
+                ScalarAtom::integer(0),
+            ))],
         },
     );
     root_nodes.insert(
@@ -505,38 +670,41 @@ fn fast_zero_factor_is_diagnostic() {
         RootSurfaceNodeKind::Output(OutputNode::default()),
     );
 
-    let diagnostics = compile_program(&TesseraProgram {
-        root_nodes,
-        containers,
-        relations: vec![
-            RootRelation::FlowsTo {
-                from: StreamSource::node(NodeId::new("main")),
-                to: StreamTarget::TransformInput {
-                    node: NodeId::new("fast"),
-                    endpoint: transform_input("main"),
+    let diagnostics = TesseraCompiler::new()
+        .compile_ir(&TesseraProgram {
+            root_nodes,
+            containers,
+            relations: vec![
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("main")),
+                    to: StreamTarget::TransformInput {
+                        node: NodeId::new("fast"),
+                        endpoint: transform_input("main"),
+                    },
                 },
-            },
-            RootRelation::FlowsTo {
-                from: StreamSource::node(NodeId::new("zero")),
-                to: StreamTarget::TransformInput {
-                    node: NodeId::new("fast"),
-                    endpoint: transform_input("factor"),
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("zero")),
+                    to: StreamTarget::TransformInput {
+                        node: NodeId::new("fast"),
+                        endpoint: transform_input("factor"),
+                    },
                 },
-            },
-            RootRelation::FlowsTo {
-                from: StreamSource::node(NodeId::new("fast")),
-                to: StreamTarget::OutputInput {
-                    node: NodeId::new("out"),
-                    endpoint: output_input("main"),
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("fast")),
+                    to: StreamTarget::OutputInput {
+                        node: NodeId::new("out"),
+                        endpoint: output_input("main"),
+                    },
                 },
-            },
-        ],
-    })
-    .expect_err("zero factor should produce a diagnostic");
+            ],
+        })
+        .expect_err("zero factor should produce a diagnostic");
 
-    assert!(diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.kind == DiagnosticKind::InvalidTransformArgument));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == DiagnosticKind::InvalidTransformArgument)
+    );
 }
 
 #[test]
@@ -547,14 +715,18 @@ fn flow_control_group_bindings_preserve_target_members() {
         ContainerId::new("a"),
         Container {
             kind: ContainerKind::Sequence,
-            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new("a")))],
+            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new(
+                "a",
+            )))],
         },
     );
     containers.insert(
         ContainerId::new("b"),
         Container {
             kind: ContainerKind::Sequence,
-            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new("b")))],
+            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new(
+                "b",
+            )))],
         },
     );
     root_nodes.insert(
@@ -578,46 +750,47 @@ fn flow_control_group_bindings_preserve_target_members() {
         RootSurfaceNodeKind::Output(OutputNode::default()),
     );
 
-    let ir = compile_program(&TesseraProgram {
-        root_nodes,
-        containers,
-        relations: vec![
-            RootRelation::FlowsTo {
-                from: StreamSource::node(NodeId::new("a")),
-                to: StreamTarget::FlowControlInput {
-                    node: NodeId::new("layer"),
-                    endpoint: InputEndpoint::GroupMember {
-                        group: PortGroupId::new("streams"),
-                        member: PortMemberId::new("b"),
+    let ir = TesseraCompiler::new()
+        .compile_ir(&TesseraProgram {
+            root_nodes,
+            containers,
+            relations: vec![
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("a")),
+                    to: StreamTarget::FlowControlInput {
+                        node: NodeId::new("layer"),
+                        endpoint: InputEndpoint::GroupMember {
+                            group: PortGroupId::new("streams"),
+                            member: PortMemberId::new("b"),
+                        },
                     },
                 },
-            },
-            RootRelation::FlowsTo {
-                from: StreamSource::node(NodeId::new("b")),
-                to: StreamTarget::FlowControlInput {
-                    node: NodeId::new("layer"),
-                    endpoint: InputEndpoint::GroupMember {
-                        group: PortGroupId::new("streams"),
-                        member: PortMemberId::new("a"),
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("b")),
+                    to: StreamTarget::FlowControlInput {
+                        node: NodeId::new("layer"),
+                        endpoint: InputEndpoint::GroupMember {
+                            group: PortGroupId::new("streams"),
+                            member: PortMemberId::new("a"),
+                        },
                     },
                 },
-            },
-            RootRelation::FlowsTo {
-                from: StreamSource::node(NodeId::new("layer")),
-                to: StreamTarget::OutputInput {
-                    node: NodeId::new("out"),
-                    endpoint: output_input("main"),
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("layer")),
+                    to: StreamTarget::OutputInput {
+                        node: NodeId::new("out"),
+                        endpoint: output_input("main"),
+                    },
                 },
-            },
-        ],
-    })
-    .expect("layer graph should compile");
+            ],
+        })
+        .expect("layer graph should compile");
 
     let values = ir.outputs[0]
         .events
         .iter()
         .filter_map(|event| match &event.value {
-            tessera::EventValue::Note { value, .. } => Some(value.clone()),
+            EventValue::Note { value, .. } => Some(value.clone()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -627,41 +800,225 @@ fn flow_control_group_bindings_preserve_target_members() {
 }
 
 #[test]
+fn public_api_compiles_simple_program() {
+    use tessera::prelude::*;
+
+    let mut root_nodes = BTreeMap::new();
+    let mut containers = BTreeMap::new();
+    containers.insert(
+        ContainerId::new("phrase"),
+        Container {
+            kind: ContainerKind::Sequence,
+            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new(
+                "a",
+            )))],
+        },
+    );
+    root_nodes.insert(
+        NodeId::new("a"),
+        RootSurfaceNodeKind::Container {
+            container: ContainerId::new("phrase"),
+        },
+    );
+    root_nodes.insert(
+        NodeId::new("out"),
+        RootSurfaceNodeKind::Output(OutputNode::default()),
+    );
+    let program = TesseraProgram {
+        root_nodes,
+        containers,
+        relations: vec![RootRelation::FlowsTo {
+            from: StreamSource::node(NodeId::new("a")),
+            to: StreamTarget::OutputInput {
+                node: NodeId::new("out"),
+                endpoint: InputEndpoint::GroupMember {
+                    group: PortGroupId::new("inputs"),
+                    member: PortMemberId::new("main"),
+                },
+            },
+        }],
+    };
+    let compiler = TesseraCompiler::new();
+    let report = compiler.compile(&program).expect("program should compile");
+    assert_eq!(report.ir.outputs.len(), 1);
+}
+
+#[test]
+fn public_api_validation_report_returns_diagnostics() {
+    use tessera::prelude::*;
+
+    let mut root_nodes = BTreeMap::new();
+    root_nodes.insert(
+        NodeId::new("slow"),
+        RootSurfaceNodeKind::Transform(TransformNode::new(TransformKind::Slow)),
+    );
+    let program = TesseraProgram {
+        root_nodes,
+        containers: BTreeMap::new(),
+        relations: vec![],
+    };
+    let compiler = TesseraCompiler::new();
+    let report = compiler.validate(&program);
+    assert!(report.is_invalid());
+    assert!(!report.diagnostics.is_empty());
+}
+
+#[test]
+fn public_api_compile_ir_returns_ir_without_exposing_pipeline() {
+    use tessera::prelude::*;
+
+    let mut root_nodes = BTreeMap::new();
+    root_nodes.insert(
+        NodeId::new("slow"),
+        RootSurfaceNodeKind::Transform(TransformNode::new(TransformKind::Slow)),
+    );
+    let program = TesseraProgram {
+        root_nodes,
+        containers: BTreeMap::new(),
+        relations: vec![],
+    };
+    let compiler = TesseraCompiler::new();
+    let result = compiler.compile_ir(&program);
+    assert!(result.is_err());
+}
+
+#[test]
+fn public_api_preview_container_uses_program_context() {
+    use tessera::prelude::*;
+
+    let mut containers = BTreeMap::new();
+    containers.insert(
+        ContainerId::new("phrase"),
+        Container {
+            kind: ContainerKind::Sequence,
+            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new(
+                "a",
+            )))],
+        },
+    );
+    let program = TesseraProgram {
+        root_nodes: BTreeMap::new(),
+        containers,
+        relations: vec![],
+    };
+    let compiler = TesseraCompiler::new();
+    let report = compiler
+        .preview_container(
+            &program,
+            ContainerId::new("phrase"),
+            CycleSpan {
+                start: CycleTime(Rational::zero()),
+                duration: CycleDuration(Rational::one()),
+            },
+        )
+        .expect("preview should compile");
+    assert_eq!(report.stream.events.len(), 1);
+
+    let diagnostics = compiler
+        .preview_container(
+            &program,
+            ContainerId::new("missing"),
+            CycleSpan {
+                start: CycleTime(Rational::zero()),
+                duration: CycleDuration(Rational::one()),
+            },
+        )
+        .expect_err("missing preview target should produce diagnostics");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == DiagnosticKind::MissingContainer)
+    );
+}
+
+#[test]
 fn chained_to_after_transform_uses_transformed_duration() {
     let mut root_nodes = BTreeMap::new();
     let mut containers = BTreeMap::new();
-    for (id, tile) in [("a", AtomTile::Note(NoteAtom::new("a"))), ("b", AtomTile::Note(NoteAtom::new("b")))] {
-        containers.insert(ContainerId::new(id), Container { kind: ContainerKind::Sequence, stack: vec![ContainerSurfaceTile::Atom(tile)] });
-        root_nodes.insert(NodeId::new(id), RootSurfaceNodeKind::Container { container: ContainerId::new(id) });
+    for (id, tile) in [
+        ("a", AtomTile::Note(NoteAtom::new("a"))),
+        ("b", AtomTile::Note(NoteAtom::new("b"))),
+    ] {
+        containers.insert(
+            ContainerId::new(id),
+            Container {
+                kind: ContainerKind::Sequence,
+                stack: vec![ContainerSurfaceTile::Atom(tile)],
+            },
+        );
+        root_nodes.insert(
+            NodeId::new(id),
+            RootSurfaceNodeKind::Container {
+                container: ContainerId::new(id),
+            },
+        );
     }
-    containers.insert(ContainerId::new("factor"), Container { kind: ContainerKind::Sequence, stack: vec![ContainerSurfaceTile::Atom(AtomTile::Scalar(ScalarAtom::integer(3)))] });
-    root_nodes.insert(NodeId::new("factor"), RootSurfaceNodeKind::Container { container: ContainerId::new("factor") });
-    root_nodes.insert(NodeId::new("slow"), RootSurfaceNodeKind::Transform(TransformNode::new(TransformKind::Slow)));
-    root_nodes.insert(NodeId::new("out"), RootSurfaceNodeKind::Output(OutputNode::default()));
+    containers.insert(
+        ContainerId::new("factor"),
+        Container {
+            kind: ContainerKind::Sequence,
+            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Scalar(
+                ScalarAtom::integer(3),
+            ))],
+        },
+    );
+    root_nodes.insert(
+        NodeId::new("factor"),
+        RootSurfaceNodeKind::Container {
+            container: ContainerId::new("factor"),
+        },
+    );
+    root_nodes.insert(
+        NodeId::new("slow"),
+        RootSurfaceNodeKind::Transform(TransformNode::new(TransformKind::Slow)),
+    );
+    root_nodes.insert(
+        NodeId::new("out"),
+        RootSurfaceNodeKind::Output(OutputNode::default()),
+    );
 
-    let ir = compile_program(&TesseraProgram {
-        root_nodes,
-        containers,
-        relations: vec![
-            RootRelation::FlowsTo {
-                from: StreamSource::node(NodeId::new("a")),
-                to: StreamTarget::TransformInput { node: NodeId::new("slow"), endpoint: transform_input("main") },
-            },
-            RootRelation::FlowsTo {
-                from: StreamSource::node(NodeId::new("factor")),
-                to: StreamTarget::TransformInput { node: NodeId::new("slow"), endpoint: transform_input("factor") },
-            },
-            RootRelation::ChainedTo { from: StreamSource::node(NodeId::new("slow")), to: NodeId::new("b") },
-            RootRelation::FlowsTo {
-                from: StreamSource::node(NodeId::new("b")),
-                to: StreamTarget::OutputInput { node: NodeId::new("out"), endpoint: output_input("main") },
-            },
-        ],
-    })
-    .expect("program should compile");
+    let ir = TesseraCompiler::new()
+        .compile_ir(&TesseraProgram {
+            root_nodes,
+            containers,
+            relations: vec![
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("a")),
+                    to: StreamTarget::TransformInput {
+                        node: NodeId::new("slow"),
+                        endpoint: transform_input("main"),
+                    },
+                },
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("factor")),
+                    to: StreamTarget::TransformInput {
+                        node: NodeId::new("slow"),
+                        endpoint: transform_input("factor"),
+                    },
+                },
+                RootRelation::ChainedTo {
+                    from: StreamSource::node(NodeId::new("slow")),
+                    to: NodeId::new("b"),
+                },
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("b")),
+                    to: StreamTarget::OutputInput {
+                        node: NodeId::new("out"),
+                        endpoint: output_input("main"),
+                    },
+                },
+            ],
+        })
+        .expect("program should compile");
 
-    assert_eq!(ir.outputs[0].events[0].span.duration.0, Rational::from_integer(3));
-    assert_eq!(ir.outputs[0].events[1].span.start.0, Rational::from_integer(3));
+    assert_eq!(
+        ir.outputs[0].events[0].span.duration.0,
+        Rational::from_integer(3)
+    );
+    assert_eq!(
+        ir.outputs[0].events[1].span.start.0,
+        Rational::from_integer(3)
+    );
 }
 
 #[test]
@@ -678,9 +1035,20 @@ fn split_outputs_are_endpoint_addressed() {
             ],
         },
     );
-    root_nodes.insert(NodeId::new("phrase"), RootSurfaceNodeKind::Container { container: ContainerId::new("phrase") });
-    root_nodes.insert(NodeId::new("split"), RootSurfaceNodeKind::FlowControl(FlowControlNode::new(FlowControlKind::Split)));
-    root_nodes.insert(NodeId::new("out"), RootSurfaceNodeKind::Output(OutputNode::default()));
+    root_nodes.insert(
+        NodeId::new("phrase"),
+        RootSurfaceNodeKind::Container {
+            container: ContainerId::new("phrase"),
+        },
+    );
+    root_nodes.insert(
+        NodeId::new("split"),
+        RootSurfaceNodeKind::FlowControl(FlowControlNode::new(FlowControlKind::Split)),
+    );
+    root_nodes.insert(
+        NodeId::new("out"),
+        RootSurfaceNodeKind::Output(OutputNode::default()),
+    );
 
     let program = TesseraProgram {
         root_nodes,
@@ -688,7 +1056,10 @@ fn split_outputs_are_endpoint_addressed() {
         relations: vec![
             RootRelation::FlowsTo {
                 from: StreamSource::node(NodeId::new("phrase")),
-                to: StreamTarget::FlowControlInput { node: NodeId::new("split"), endpoint: transform_input("main") },
+                to: StreamTarget::FlowControlInput {
+                    node: NodeId::new("split"),
+                    endpoint: transform_input("main"),
+                },
             },
             RootRelation::FlowsTo {
                 from: StreamSource {
@@ -698,7 +1069,10 @@ fn split_outputs_are_endpoint_addressed() {
                         member: PortMemberId::new("even"),
                     },
                 },
-                to: StreamTarget::OutputInput { node: NodeId::new("out"), endpoint: output_input("even") },
+                to: StreamTarget::OutputInput {
+                    node: NodeId::new("out"),
+                    endpoint: output_input("even"),
+                },
             },
             RootRelation::FlowsTo {
                 from: StreamSource {
@@ -708,12 +1082,17 @@ fn split_outputs_are_endpoint_addressed() {
                         member: PortMemberId::new("odd"),
                     },
                 },
-                to: StreamTarget::OutputInput { node: NodeId::new("out"), endpoint: output_input("odd") },
+                to: StreamTarget::OutputInput {
+                    node: NodeId::new("out"),
+                    endpoint: output_input("odd"),
+                },
             },
         ],
     };
 
-    let ir = compile_program(&program).expect("split program should compile");
+    let ir = TesseraCompiler::new()
+        .compile_ir(&program)
+        .expect("split program should compile");
     assert_eq!(ir.outputs[0].events.len(), 2);
 }
 
@@ -724,12 +1103,28 @@ fn flow_control_layer_compiles_and_normalized_entrypoint_matches() {
     for id in ["a", "b"] {
         containers.insert(
             ContainerId::new(id),
-            Container { kind: ContainerKind::Sequence, stack: vec![ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new(id)))] },
+            Container {
+                kind: ContainerKind::Sequence,
+                stack: vec![ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new(
+                    id,
+                )))],
+            },
         );
-        root_nodes.insert(NodeId::new(id), RootSurfaceNodeKind::Container { container: ContainerId::new(id) });
+        root_nodes.insert(
+            NodeId::new(id),
+            RootSurfaceNodeKind::Container {
+                container: ContainerId::new(id),
+            },
+        );
     }
-    root_nodes.insert(NodeId::new("layer"), RootSurfaceNodeKind::FlowControl(FlowControlNode::new(FlowControlKind::Layer)));
-    root_nodes.insert(NodeId::new("out"), RootSurfaceNodeKind::Output(OutputNode::default()));
+    root_nodes.insert(
+        NodeId::new("layer"),
+        RootSurfaceNodeKind::FlowControl(FlowControlNode::new(FlowControlKind::Layer)),
+    );
+    root_nodes.insert(
+        NodeId::new("out"),
+        RootSurfaceNodeKind::Output(OutputNode::default()),
+    );
 
     let program = TesseraProgram {
         root_nodes,
@@ -739,26 +1134,37 @@ fn flow_control_layer_compiles_and_normalized_entrypoint_matches() {
                 from: StreamSource::node(NodeId::new("a")),
                 to: StreamTarget::FlowControlInput {
                     node: NodeId::new("layer"),
-                    endpoint: InputEndpoint::GroupMember { group: PortGroupId::new("streams"), member: PortMemberId::new("a") },
+                    endpoint: InputEndpoint::GroupMember {
+                        group: PortGroupId::new("streams"),
+                        member: PortMemberId::new("a"),
+                    },
                 },
             },
             RootRelation::FlowsTo {
                 from: StreamSource::node(NodeId::new("b")),
                 to: StreamTarget::FlowControlInput {
                     node: NodeId::new("layer"),
-                    endpoint: InputEndpoint::GroupMember { group: PortGroupId::new("streams"), member: PortMemberId::new("b") },
+                    endpoint: InputEndpoint::GroupMember {
+                        group: PortGroupId::new("streams"),
+                        member: PortMemberId::new("b"),
+                    },
                 },
             },
             RootRelation::FlowsTo {
                 from: StreamSource::node(NodeId::new("layer")),
-                to: StreamTarget::OutputInput { node: NodeId::new("out"), endpoint: output_input("main") },
+                to: StreamTarget::OutputInput {
+                    node: NodeId::new("out"),
+                    endpoint: output_input("main"),
+                },
             },
         ],
     };
 
-    let normalized = normalize_program(&program).expect("program should normalize");
-    let ir = compile_normalized_program(&normalized).expect("normalized program should compile");
-    assert_eq!(ir.outputs[0].events.len(), 2);
+    let report = TesseraCompiler::new()
+        .compile(&program)
+        .expect("program should compile");
+    assert_eq!(report.normalized.containers.len(), 2);
+    assert_eq!(report.ir.outputs[0].events.len(), 2);
 }
 
 #[test]
@@ -768,44 +1174,73 @@ fn merge_append_chains_streams_sequentially() {
     for id in ["a", "b"] {
         containers.insert(
             ContainerId::new(id),
-            Container { kind: ContainerKind::Sequence, stack: vec![ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new(id)))] },
+            Container {
+                kind: ContainerKind::Sequence,
+                stack: vec![ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new(
+                    id,
+                )))],
+            },
         );
-        root_nodes.insert(NodeId::new(id), RootSurfaceNodeKind::Container { container: ContainerId::new(id) });
+        root_nodes.insert(
+            NodeId::new(id),
+            RootSurfaceNodeKind::Container {
+                container: ContainerId::new(id),
+            },
+        );
     }
     root_nodes.insert(
         NodeId::new("merge"),
-        RootSurfaceNodeKind::FlowControl(FlowControlNode::new(FlowControlKind::Merge).with_policy(FlowControlPolicy::MergeAppend)),
+        RootSurfaceNodeKind::FlowControl(
+            FlowControlNode::new(FlowControlKind::Merge)
+                .with_policy(FlowControlPolicy::MergeAppend),
+        ),
     );
-    root_nodes.insert(NodeId::new("out"), RootSurfaceNodeKind::Output(OutputNode::default()));
+    root_nodes.insert(
+        NodeId::new("out"),
+        RootSurfaceNodeKind::Output(OutputNode::default()),
+    );
 
-    let ir = compile_program(&TesseraProgram {
-        root_nodes,
-        containers,
-        relations: vec![
-            RootRelation::FlowsTo {
-                from: StreamSource::node(NodeId::new("a")),
-                to: StreamTarget::FlowControlInput {
-                    node: NodeId::new("merge"),
-                    endpoint: InputEndpoint::GroupMember { group: PortGroupId::new("streams"), member: PortMemberId::new("a") },
+    let ir = TesseraCompiler::new()
+        .compile_ir(&TesseraProgram {
+            root_nodes,
+            containers,
+            relations: vec![
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("a")),
+                    to: StreamTarget::FlowControlInput {
+                        node: NodeId::new("merge"),
+                        endpoint: InputEndpoint::GroupMember {
+                            group: PortGroupId::new("streams"),
+                            member: PortMemberId::new("a"),
+                        },
+                    },
                 },
-            },
-            RootRelation::FlowsTo {
-                from: StreamSource::node(NodeId::new("b")),
-                to: StreamTarget::FlowControlInput {
-                    node: NodeId::new("merge"),
-                    endpoint: InputEndpoint::GroupMember { group: PortGroupId::new("streams"), member: PortMemberId::new("b") },
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("b")),
+                    to: StreamTarget::FlowControlInput {
+                        node: NodeId::new("merge"),
+                        endpoint: InputEndpoint::GroupMember {
+                            group: PortGroupId::new("streams"),
+                            member: PortMemberId::new("b"),
+                        },
+                    },
                 },
-            },
-            RootRelation::FlowsTo {
-                from: StreamSource::node(NodeId::new("merge")),
-                to: StreamTarget::OutputInput { node: NodeId::new("out"), endpoint: output_input("main") },
-            },
-        ],
-    })
-    .expect("merge append should compile");
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("merge")),
+                    to: StreamTarget::OutputInput {
+                        node: NodeId::new("out"),
+                        endpoint: output_input("main"),
+                    },
+                },
+            ],
+        })
+        .expect("merge append should compile");
 
     assert_eq!(ir.outputs[0].events.len(), 2);
-    assert_eq!(ir.outputs[0].events[1].span.start.0, Rational::from_integer(1));
+    assert_eq!(
+        ir.outputs[0].events[1].span.start.0,
+        Rational::from_integer(1)
+    );
 }
 
 #[test]
@@ -814,43 +1249,82 @@ fn mask_scale_adds_gain_from_mask_stream() {
     let mut containers = BTreeMap::new();
     containers.insert(
         ContainerId::new("main"),
-        Container { kind: ContainerKind::Sequence, stack: vec![ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new("a")))] },
+        Container {
+            kind: ContainerKind::Sequence,
+            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new(
+                "a",
+            )))],
+        },
     );
     containers.insert(
         ContainerId::new("mask"),
-        Container { kind: ContainerKind::Sequence, stack: vec![ContainerSurfaceTile::Atom(AtomTile::Scalar(ScalarAtom::integer(3)))] },
+        Container {
+            kind: ContainerKind::Sequence,
+            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Scalar(
+                ScalarAtom::integer(3),
+            ))],
+        },
     );
-    root_nodes.insert(NodeId::new("main"), RootSurfaceNodeKind::Container { container: ContainerId::new("main") });
-    root_nodes.insert(NodeId::new("mask_src"), RootSurfaceNodeKind::Container { container: ContainerId::new("mask") });
+    root_nodes.insert(
+        NodeId::new("main"),
+        RootSurfaceNodeKind::Container {
+            container: ContainerId::new("main"),
+        },
+    );
+    root_nodes.insert(
+        NodeId::new("mask_src"),
+        RootSurfaceNodeKind::Container {
+            container: ContainerId::new("mask"),
+        },
+    );
     root_nodes.insert(
         NodeId::new("mask"),
-        RootSurfaceNodeKind::FlowControl(FlowControlNode::new(FlowControlKind::Mask).with_policy(FlowControlPolicy::MaskScale)),
+        RootSurfaceNodeKind::FlowControl(
+            FlowControlNode::new(FlowControlKind::Mask).with_policy(FlowControlPolicy::MaskScale),
+        ),
     );
-    root_nodes.insert(NodeId::new("out"), RootSurfaceNodeKind::Output(OutputNode::default()));
+    root_nodes.insert(
+        NodeId::new("out"),
+        RootSurfaceNodeKind::Output(OutputNode::default()),
+    );
 
-    let ir = compile_program(&TesseraProgram {
-        root_nodes,
-        containers,
-        relations: vec![
-            RootRelation::FlowsTo {
-                from: StreamSource::node(NodeId::new("main")),
-                to: StreamTarget::FlowControlInput { node: NodeId::new("mask"), endpoint: transform_input("main") },
-            },
-            RootRelation::FlowsTo {
-                from: StreamSource::node(NodeId::new("mask_src")),
-                to: StreamTarget::FlowControlInput { node: NodeId::new("mask"), endpoint: transform_input("mask") },
-            },
-            RootRelation::FlowsTo {
-                from: StreamSource::node(NodeId::new("mask")),
-                to: StreamTarget::OutputInput { node: NodeId::new("out"), endpoint: output_input("main") },
-            },
-        ],
-    })
-    .expect("mask scale should compile");
+    let ir = TesseraCompiler::new()
+        .compile_ir(&TesseraProgram {
+            root_nodes,
+            containers,
+            relations: vec![
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("main")),
+                    to: StreamTarget::FlowControlInput {
+                        node: NodeId::new("mask"),
+                        endpoint: transform_input("main"),
+                    },
+                },
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("mask_src")),
+                    to: StreamTarget::FlowControlInput {
+                        node: NodeId::new("mask"),
+                        endpoint: transform_input("mask"),
+                    },
+                },
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("mask")),
+                    to: StreamTarget::OutputInput {
+                        node: NodeId::new("out"),
+                        endpoint: output_input("main"),
+                    },
+                },
+            ],
+        })
+        .expect("mask scale should compile");
 
-    assert!(ir.outputs[0].events[0]
-        .fields
-        .contains(&EventField::Gain(FieldValue::Rational { value: Rational::from_integer(3) })));
+    assert!(
+        ir.outputs[0].events[0]
+            .fields
+            .contains(&EventField::Gain(FieldValue::Rational {
+                value: Rational::from_integer(3)
+            }))
+    );
 }
 
 #[test]
@@ -867,46 +1341,68 @@ fn route_by_label_partitions_named_note_streams() {
             ],
         },
     );
-    root_nodes.insert(NodeId::new("phrase"), RootSurfaceNodeKind::Container { container: ContainerId::new("phrase") });
-    let mut route = FlowControlNode::new(FlowControlKind::Route).with_policy(FlowControlPolicy::RouteByLabel);
+    root_nodes.insert(
+        NodeId::new("phrase"),
+        RootSurfaceNodeKind::Container {
+            container: ContainerId::new("phrase"),
+        },
+    );
+    let mut route =
+        FlowControlNode::new(FlowControlKind::Route).with_policy(FlowControlPolicy::RouteByLabel);
     route.members.outputs.insert(
         PortGroupId::new("routes"),
         vec![PortMemberId::new("a"), PortMemberId::new("b")],
     );
-    root_nodes.insert(NodeId::new("route"), RootSurfaceNodeKind::FlowControl(route));
-    root_nodes.insert(NodeId::new("out"), RootSurfaceNodeKind::Output(OutputNode::default()));
+    root_nodes.insert(
+        NodeId::new("route"),
+        RootSurfaceNodeKind::FlowControl(route),
+    );
+    root_nodes.insert(
+        NodeId::new("out"),
+        RootSurfaceNodeKind::Output(OutputNode::default()),
+    );
 
-    let ir = compile_program(&TesseraProgram {
-        root_nodes,
-        containers,
-        relations: vec![
-            RootRelation::FlowsTo {
-                from: StreamSource::node(NodeId::new("phrase")),
-                to: StreamTarget::FlowControlInput { node: NodeId::new("route"), endpoint: transform_input("main") },
-            },
-            RootRelation::FlowsTo {
-                from: StreamSource {
-                    node: NodeId::new("route"),
-                    endpoint: OutputEndpoint::GroupMember {
-                        group: PortGroupId::new("routes"),
-                        member: PortMemberId::new("a"),
+    let ir = TesseraCompiler::new()
+        .compile_ir(&TesseraProgram {
+            root_nodes,
+            containers,
+            relations: vec![
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("phrase")),
+                    to: StreamTarget::FlowControlInput {
+                        node: NodeId::new("route"),
+                        endpoint: transform_input("main"),
                     },
                 },
-                to: StreamTarget::OutputInput { node: NodeId::new("out"), endpoint: output_input("a") },
-            },
-            RootRelation::FlowsTo {
-                from: StreamSource {
-                    node: NodeId::new("route"),
-                    endpoint: OutputEndpoint::GroupMember {
-                        group: PortGroupId::new("routes"),
-                        member: PortMemberId::new("b"),
+                RootRelation::FlowsTo {
+                    from: StreamSource {
+                        node: NodeId::new("route"),
+                        endpoint: OutputEndpoint::GroupMember {
+                            group: PortGroupId::new("routes"),
+                            member: PortMemberId::new("a"),
+                        },
+                    },
+                    to: StreamTarget::OutputInput {
+                        node: NodeId::new("out"),
+                        endpoint: output_input("a"),
                     },
                 },
-                to: StreamTarget::OutputInput { node: NodeId::new("out"), endpoint: output_input("b") },
-            },
-        ],
-    })
-    .expect("route by label should compile");
+                RootRelation::FlowsTo {
+                    from: StreamSource {
+                        node: NodeId::new("route"),
+                        endpoint: OutputEndpoint::GroupMember {
+                            group: PortGroupId::new("routes"),
+                            member: PortMemberId::new("b"),
+                        },
+                    },
+                    to: StreamTarget::OutputInput {
+                        node: NodeId::new("out"),
+                        endpoint: output_input("b"),
+                    },
+                },
+            ],
+        })
+        .expect("route by label should compile");
 
     assert_eq!(ir.outputs[0].events.len(), 2);
 }
@@ -918,53 +1414,92 @@ fn switch_control_value_selects_candidate_index() {
     for id in ["a", "b"] {
         containers.insert(
             ContainerId::new(id),
-            Container { kind: ContainerKind::Sequence, stack: vec![ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new(id)))] },
+            Container {
+                kind: ContainerKind::Sequence,
+                stack: vec![ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new(
+                    id,
+                )))],
+            },
         );
-        root_nodes.insert(NodeId::new(id), RootSurfaceNodeKind::Container { container: ContainerId::new(id) });
+        root_nodes.insert(
+            NodeId::new(id),
+            RootSurfaceNodeKind::Container {
+                container: ContainerId::new(id),
+            },
+        );
     }
     containers.insert(
         ContainerId::new("ctrl"),
-        Container { kind: ContainerKind::Sequence, stack: vec![ContainerSurfaceTile::Atom(AtomTile::Scalar(ScalarAtom::integer(1)))] },
+        Container {
+            kind: ContainerKind::Sequence,
+            stack: vec![ContainerSurfaceTile::Atom(AtomTile::Scalar(
+                ScalarAtom::integer(1),
+            ))],
+        },
     );
-    root_nodes.insert(NodeId::new("ctrl"), RootSurfaceNodeKind::Container { container: ContainerId::new("ctrl") });
+    root_nodes.insert(
+        NodeId::new("ctrl"),
+        RootSurfaceNodeKind::Container {
+            container: ContainerId::new("ctrl"),
+        },
+    );
     root_nodes.insert(
         NodeId::new("switch"),
-        RootSurfaceNodeKind::FlowControl(FlowControlNode::new(FlowControlKind::Switch).with_policy(FlowControlPolicy::SwitchControlValue)),
+        RootSurfaceNodeKind::FlowControl(
+            FlowControlNode::new(FlowControlKind::Switch)
+                .with_policy(FlowControlPolicy::SwitchControlValue),
+        ),
     );
-    root_nodes.insert(NodeId::new("out"), RootSurfaceNodeKind::Output(OutputNode::default()));
+    root_nodes.insert(
+        NodeId::new("out"),
+        RootSurfaceNodeKind::Output(OutputNode::default()),
+    );
 
-    let ir = compile_program(&TesseraProgram {
-        root_nodes,
-        containers,
-        relations: vec![
-            RootRelation::FlowsTo {
-                from: StreamSource::node(NodeId::new("a")),
-                to: StreamTarget::FlowControlInput {
-                    node: NodeId::new("switch"),
-                    endpoint: InputEndpoint::GroupMember { group: PortGroupId::new("candidates"), member: PortMemberId::new("a") },
+    let ir = TesseraCompiler::new()
+        .compile_ir(&TesseraProgram {
+            root_nodes,
+            containers,
+            relations: vec![
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("a")),
+                    to: StreamTarget::FlowControlInput {
+                        node: NodeId::new("switch"),
+                        endpoint: InputEndpoint::GroupMember {
+                            group: PortGroupId::new("candidates"),
+                            member: PortMemberId::new("a"),
+                        },
+                    },
                 },
-            },
-            RootRelation::FlowsTo {
-                from: StreamSource::node(NodeId::new("b")),
-                to: StreamTarget::FlowControlInput {
-                    node: NodeId::new("switch"),
-                    endpoint: InputEndpoint::GroupMember { group: PortGroupId::new("candidates"), member: PortMemberId::new("b") },
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("b")),
+                    to: StreamTarget::FlowControlInput {
+                        node: NodeId::new("switch"),
+                        endpoint: InputEndpoint::GroupMember {
+                            group: PortGroupId::new("candidates"),
+                            member: PortMemberId::new("b"),
+                        },
+                    },
                 },
-            },
-            RootRelation::FlowsTo {
-                from: StreamSource::node(NodeId::new("ctrl")),
-                to: StreamTarget::FlowControlInput { node: NodeId::new("switch"), endpoint: transform_input("control") },
-            },
-            RootRelation::FlowsTo {
-                from: StreamSource::node(NodeId::new("switch")),
-                to: StreamTarget::OutputInput { node: NodeId::new("out"), endpoint: output_input("main") },
-            },
-        ],
-    })
-    .expect("switch control value should compile");
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("ctrl")),
+                    to: StreamTarget::FlowControlInput {
+                        node: NodeId::new("switch"),
+                        endpoint: transform_input("control"),
+                    },
+                },
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("switch")),
+                    to: StreamTarget::OutputInput {
+                        node: NodeId::new("out"),
+                        endpoint: output_input("main"),
+                    },
+                },
+            ],
+        })
+        .expect("switch control value should compile");
 
     match &ir.outputs[0].events[0].value {
-        tessera::EventValue::Note { value, .. } => assert_eq!(value, "b"),
+        EventValue::Note { value, .. } => assert_eq!(value, "b"),
         other => panic!("expected note event, got {other:?}"),
     }
 }
