@@ -7,7 +7,7 @@ use crate::domain::{
 };
 
 use super::compile_transform::default_stream;
-use super::flow_policy::{apply_flow_control_policy, NodeInputs, NodeOutputs};
+use super::flow_policy::{NodeInputs, NodeOutputs, apply_flow_control_policy};
 
 pub fn compile_flow_control_node<F>(
     program: &NormalizedProgram,

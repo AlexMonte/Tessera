@@ -12,32 +12,110 @@ pub type NodeOutputs = BTreeMap<OutputEndpoint, PatternStream>;
 #[allow(dead_code)]
 pub fn flow_policy_contract_table() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("layer", "Deterministic compile-time layering of all input streams."),
-        ("merge_append", "Deterministic compile-time append of input streams in member order."),
-        ("merge_interleave", "Deterministic compile-time span-ordered interleave of input streams."),
-        ("merge_priority", "Deterministic compile-time conflict resolution where earlier streams win overlaps."),
-        ("merge_deduplicate", "Deterministic compile-time duplicate filtering by event fingerprint."),
-        ("mix_field_blend", "Deterministic compile-time field blending across grouped inputs."),
-        ("mix_weighted", "Deterministic compile-time weighted gain shaping using the control amount when present."),
-        ("mix_gain_average", "Deterministic compile-time average gain shaping across grouped inputs."),
-        ("split_copy_to_all", "Deterministic compile-time copy of each input event to every output member."),
-        ("split_by_index_modulo", "Deterministic compile-time round-robin partition by event index."),
-        ("split_by_event_field", "Deterministic compile-time partition by matching event fields to output member ids."),
-        ("split_by_pitch_range", "Deterministic compile-time partition by note octave threshold."),
-        ("mask_gate", "Deterministic compile-time gate using mask activity spans."),
-        ("mask_scale", "Deterministic compile-time gain scaling using mask scalar values."),
-        ("mask_clip", "Deterministic compile-time clipping to active mask spans."),
-        ("mask_invert_gate", "Deterministic compile-time inverse gate using mask inactivity."),
-        ("switch_cycle_index", "Deterministic compile-time candidate selection using the current cycle index fallback."),
-        ("switch_control_value", "Deterministic compile-time candidate selection using the first control scalar."),
-        ("switch_seeded_random", "Deterministic compile-time seeded selection, not runtime-live random."),
-        ("route_by_event_field", "Deterministic compile-time routing by field label matching."),
-        ("route_by_index_modulo", "Deterministic compile-time routing by event index modulo output count."),
-        ("route_by_control_value", "Deterministic compile-time routing by the first control scalar."),
-        ("route_by_label", "Deterministic compile-time routing by note label matching."),
-        ("choice_cycle", "Deterministic compile-time option selection by cycle index fallback."),
-        ("choice_seeded_random", "Deterministic compile-time seeded option selection."),
-        ("choice_weighted", "Deterministic compile-time weighted option selection from control data."),
+        (
+            "layer",
+            "Deterministic compile-time layering of all input streams.",
+        ),
+        (
+            "merge_append",
+            "Deterministic compile-time append of input streams in member order.",
+        ),
+        (
+            "merge_interleave",
+            "Deterministic compile-time span-ordered interleave of input streams.",
+        ),
+        (
+            "merge_priority",
+            "Deterministic compile-time conflict resolution where earlier streams win overlaps.",
+        ),
+        (
+            "merge_deduplicate",
+            "Deterministic compile-time duplicate filtering by event fingerprint.",
+        ),
+        (
+            "mix_field_blend",
+            "Deterministic compile-time field blending across grouped inputs.",
+        ),
+        (
+            "mix_weighted",
+            "Deterministic compile-time weighted gain shaping using the control amount when present.",
+        ),
+        (
+            "mix_gain_average",
+            "Deterministic compile-time average gain shaping across grouped inputs.",
+        ),
+        (
+            "split_copy_to_all",
+            "Deterministic compile-time copy of each input event to every output member.",
+        ),
+        (
+            "split_by_index_modulo",
+            "Deterministic compile-time round-robin partition by event index.",
+        ),
+        (
+            "split_by_event_field",
+            "Deterministic compile-time partition by matching event fields to output member ids.",
+        ),
+        (
+            "split_by_pitch_range",
+            "Deterministic compile-time partition by note octave threshold.",
+        ),
+        (
+            "mask_gate",
+            "Deterministic compile-time gate using mask activity spans.",
+        ),
+        (
+            "mask_scale",
+            "Deterministic compile-time gain scaling using mask scalar values.",
+        ),
+        (
+            "mask_clip",
+            "Deterministic compile-time clipping to active mask spans.",
+        ),
+        (
+            "mask_invert_gate",
+            "Deterministic compile-time inverse gate using mask inactivity.",
+        ),
+        (
+            "switch_cycle_index",
+            "Deterministic compile-time candidate selection using the current cycle index fallback.",
+        ),
+        (
+            "switch_control_value",
+            "Deterministic compile-time candidate selection using the first control scalar.",
+        ),
+        (
+            "switch_seeded_random",
+            "Deterministic compile-time seeded selection, not runtime-live random.",
+        ),
+        (
+            "route_by_event_field",
+            "Deterministic compile-time routing by field label matching.",
+        ),
+        (
+            "route_by_index_modulo",
+            "Deterministic compile-time routing by event index modulo output count.",
+        ),
+        (
+            "route_by_control_value",
+            "Deterministic compile-time routing by the first control scalar.",
+        ),
+        (
+            "route_by_label",
+            "Deterministic compile-time routing by note label matching.",
+        ),
+        (
+            "choice_cycle",
+            "Deterministic compile-time option selection by cycle index fallback.",
+        ),
+        (
+            "choice_seeded_random",
+            "Deterministic compile-time seeded option selection.",
+        ),
+        (
+            "choice_weighted",
+            "Deterministic compile-time weighted option selection from control data.",
+        ),
     ]
 }
 
@@ -52,7 +130,10 @@ pub fn apply_flow_control_policy(
         )]),
         FlowControlKind::Merge => BTreeMap::from_iter([(
             OutputEndpoint::Socket(OutputPort::new("out")),
-            apply_merge_policy(control, collect_group_inputs(&inputs, &PortGroupId::new("streams"))),
+            apply_merge_policy(
+                control,
+                collect_group_inputs(&inputs, &PortGroupId::new("streams")),
+            ),
         )]),
         FlowControlKind::Mix => BTreeMap::from_iter([(
             OutputEndpoint::Socket(OutputPort::new("out")),
@@ -115,7 +196,12 @@ pub fn apply_flow_control_policy(
                         group: PortGroupId::new("routes"),
                         member: member.clone(),
                     },
-                    apply_route_policy(control, main.clone(), first_socket_input(&inputs, "control"), member),
+                    apply_route_policy(
+                        control,
+                        main.clone(),
+                        first_socket_input(&inputs, "control"),
+                        member,
+                    ),
                 );
             }
             outputs
@@ -220,7 +306,11 @@ fn deduplicate_stream(stream: PatternStream) -> PatternStream {
 fn blend_fields(mut stream: PatternStream) -> PatternStream {
     let gain = average_gain_from_stream(&stream).unwrap_or_else(Rational::one);
     for event in &mut stream.events {
-        if !event.fields.iter().any(|field| matches!(field, EventField::Gain(_))) {
+        if !event
+            .fields
+            .iter()
+            .any(|field| matches!(field, EventField::Gain(_)))
+        {
             event
                 .fields
                 .push(EventField::Gain(FieldValue::Rational { value: gain }));
@@ -306,7 +396,11 @@ fn clip_by_mask(main: PatternStream, mask: &PatternStream) -> PatternStream {
             };
             let event_end = event.span.start.0 + event.span.duration.0;
             let mask_end = mask_event.span.start.0 + mask_event.span.duration.0;
-            let end = if event_end < mask_end { event_end } else { mask_end };
+            let end = if event_end < mask_end {
+                event_end
+            } else {
+                mask_end
+            };
             if end > start {
                 let mut clipped_event = event.clone();
                 clipped_event.span.start = CycleTime(start);
@@ -413,11 +507,9 @@ fn deterministic_event_seed(event: &PatternEvent) -> u64 {
         + event.span.duration.0.denominator as i128 * 7) as u64;
     match &event.value {
         crate::domain::EventValue::Note { value, octave } => {
-            base
-                ^ value
-                    .bytes()
-                    .fold(0u64, |acc, byte| acc.wrapping_mul(33).wrapping_add(byte as u64))
-                ^ octave.unwrap_or_default() as u64
+            base ^ value.bytes().fold(0u64, |acc, byte| {
+                acc.wrapping_mul(33).wrapping_add(byte as u64)
+            }) ^ octave.unwrap_or_default() as u64
         }
         crate::domain::EventValue::Rest => base ^ 0x9E37,
         crate::domain::EventValue::Scalar { value } => {
@@ -536,7 +628,9 @@ fn apply_mix_policy(
     let amount_value = scalar_stream_value(amount.as_ref()).unwrap_or_else(Rational::one);
     match control.policy {
         FlowControlPolicy::MixFieldBlend => blend_fields(PatternStream::layer(streams)),
-        FlowControlPolicy::MixWeighted => add_gain_field(PatternStream::layer(streams), amount_value),
+        FlowControlPolicy::MixWeighted => {
+            add_gain_field(PatternStream::layer(streams), amount_value)
+        }
         FlowControlPolicy::MixGainAverage => {
             let layered = PatternStream::layer(streams);
             add_gain_field(
@@ -566,7 +660,11 @@ fn apply_split_policy(
     }
 }
 
-fn apply_mask_policy(control: &FlowControlNode, main: PatternStream, mask: PatternStream) -> PatternStream {
+fn apply_mask_policy(
+    control: &FlowControlNode,
+    main: PatternStream,
+    mask: PatternStream,
+) -> PatternStream {
     match control.policy {
         FlowControlPolicy::MaskGate => gate_by_mask(main, &mask, false),
         FlowControlPolicy::MaskScale => scale_by_mask(main, &mask),
@@ -651,7 +749,11 @@ fn split_stream(stream: PatternStream, keep_even: bool) -> PatternStream {
             .into_iter()
             .enumerate()
             .filter_map(|(index, event)| {
-                let keep = if keep_even { index % 2 == 0 } else { index % 2 == 1 };
+                let keep = if keep_even {
+                    index % 2 == 0
+                } else {
+                    index % 2 == 1
+                };
                 keep.then_some(event)
             })
             .collect(),

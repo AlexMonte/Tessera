@@ -25,18 +25,24 @@ pub fn normalize_container(
     let mut index = 0usize;
 
     while index < container.stack.len() {
-        let expr = parse_atom_expr(program, container_id, &container.stack, &mut index, &mut diagnostics);
+        let expr = parse_atom_expr(
+            program,
+            container_id,
+            &container.stack,
+            &mut index,
+            &mut diagnostics,
+        );
         if let Some(expr) = expr {
             exprs.push(expr);
         }
     }
 
     if diagnostics.is_empty() {
-        Ok(NormalizedContainer {
-            id: container_id.clone(),
-            kind: container.kind,
+        Ok(NormalizedContainer::new(
+            container_id.clone(),
+            container.kind,
             exprs,
-        })
+        ))
     } else {
         Err(diagnostics)
     }
@@ -76,9 +82,12 @@ fn parse_atom_expr(
             break;
         };
         let mut members = vec![expr, rhs];
-        while matches!(stack.get(*index), Some(ContainerSurfaceTile::Atom(AtomTile::Operator(next))) if next == token) {
+        while matches!(stack.get(*index), Some(ContainerSurfaceTile::Atom(AtomTile::Operator(next))) if next == token)
+        {
             *index += 1;
-            if let Some(member) = parse_simple_expr(program, container_id, stack, index, diagnostics) {
+            if let Some(member) =
+                parse_simple_expr(program, container_id, stack, index, diagnostics)
+            {
                 members.push(member);
             } else {
                 break;
@@ -113,8 +122,13 @@ fn parse_simple_expr(
     let value = match stack.get(*index)? {
         ContainerSurfaceTile::Atom(AtomTile::Note(note)) => {
             let mut note = note.clone();
-            if let Some(ContainerSurfaceTile::Atom(AtomTile::Scalar(octave))) = stack.get(*index + 1) {
-                if matches!(stack.get(*index + 2), Some(ContainerSurfaceTile::Atom(AtomTile::Scalar(_)))) {
+            if let Some(ContainerSurfaceTile::Atom(AtomTile::Scalar(octave))) =
+                stack.get(*index + 1)
+            {
+                if matches!(
+                    stack.get(*index + 2),
+                    Some(ContainerSurfaceTile::Atom(AtomTile::Scalar(_)))
+                ) {
                     diagnostics.push(Diagnostic::new(
                         DiagnosticCategory::LocalGrammar,
                         DiagnosticKind::AmbiguousOctaveBinding,
@@ -124,7 +138,10 @@ fn parse_simple_expr(
                             index: *index + 1,
                         }),
                     ));
-                    while matches!(stack.get(*index + 1), Some(ContainerSurfaceTile::Atom(AtomTile::Scalar(_)))) {
+                    while matches!(
+                        stack.get(*index + 1),
+                        Some(ContainerSurfaceTile::Atom(AtomTile::Scalar(_)))
+                    ) {
                         *index += 1;
                     }
                 } else if octave.value.denominator == 1 {
@@ -146,8 +163,12 @@ fn parse_simple_expr(
             MusicalValue::Note(note)
         }
         ContainerSurfaceTile::Atom(AtomTile::Rest) => MusicalValue::Rest,
-        ContainerSurfaceTile::Atom(AtomTile::Scalar(scalar)) => MusicalValue::Scalar(scalar.clone()),
-        ContainerSurfaceTile::NestedContainer(nested) => MusicalValue::NestedContainer(nested.clone()),
+        ContainerSurfaceTile::Atom(AtomTile::Scalar(scalar)) => {
+            MusicalValue::Scalar(scalar.clone())
+        }
+        ContainerSurfaceTile::NestedContainer(nested) => {
+            MusicalValue::NestedContainer(nested.clone())
+        }
         ContainerSurfaceTile::Transform => {
             diagnostics.push(Diagnostic::new(
                 DiagnosticCategory::Placement,
@@ -188,12 +209,16 @@ fn parse_simple_expr(
             index: *index,
         });
         match &stack[*index] {
-            ContainerSurfaceTile::Atom(AtomTile::Operator(AtomOperatorToken::Choice | AtomOperatorToken::Parallel)) => {
+            ContainerSurfaceTile::Atom(AtomTile::Operator(
+                AtomOperatorToken::Choice | AtomOperatorToken::Parallel,
+            )) => {
                 break;
             }
             ContainerSurfaceTile::Atom(AtomTile::Operator(token)) => match token {
                 AtomOperatorToken::Degrade => {
-                    if let Some(ContainerSurfaceTile::Atom(AtomTile::Scalar(scalar))) = stack.get(*index + 1) {
+                    if let Some(ContainerSurfaceTile::Atom(AtomTile::Scalar(scalar))) =
+                        stack.get(*index + 1)
+                    {
                         if scalar.value < Rational::zero() || scalar.value > Rational::one() {
                             diagnostics.push(Diagnostic::new(
                                 DiagnosticCategory::LocalGrammar,
@@ -215,7 +240,9 @@ fn parse_simple_expr(
                 | AtomOperatorToken::Replicate
                 | AtomOperatorToken::Euclid
                 | AtomOperatorToken::EuclidRot => {
-                    let Some(ContainerSurfaceTile::Atom(AtomTile::Scalar(scalar))) = stack.get(*index + 1) else {
+                    let Some(ContainerSurfaceTile::Atom(AtomTile::Scalar(scalar))) =
+                        stack.get(*index + 1)
+                    else {
                         diagnostics.push(Diagnostic::new(
                             DiagnosticCategory::LocalGrammar,
                             DiagnosticKind::OperatorWithoutRightScalar,
@@ -225,7 +252,14 @@ fn parse_simple_expr(
                         *index += 1;
                         break;
                     };
-                    let modifier = build_modifier(token, scalar.value, stack, index, container_id, diagnostics);
+                    let modifier = build_modifier(
+                        token,
+                        scalar.value,
+                        stack,
+                        index,
+                        container_id,
+                        diagnostics,
+                    );
                     modifiers.push(modifier);
                 }
                 AtomOperatorToken::Choice | AtomOperatorToken::Parallel => unreachable!(),
@@ -305,7 +339,8 @@ fn build_modifier(
             }
         }
         AtomOperatorToken::Euclid => {
-            let Some(ContainerSurfaceTile::Atom(AtomTile::Scalar(steps))) = stack.get(*index + 2) else {
+            let Some(ContainerSurfaceTile::Atom(AtomTile::Scalar(steps))) = stack.get(*index + 2)
+            else {
                 diagnostics.push(Diagnostic::new(
                     DiagnosticCategory::LocalGrammar,
                     DiagnosticKind::OperatorWithoutRightScalar,
@@ -313,7 +348,10 @@ fn build_modifier(
                     next_location.clone(),
                 ));
                 *index += 2;
-                return AtomModifier::Euclid { pulses: 1, steps: 1 };
+                return AtomModifier::Euclid {
+                    pulses: 1,
+                    steps: 1,
+                };
             };
             if scalar.denominator != 1
                 || steps.value.denominator != 1
@@ -335,7 +373,8 @@ fn build_modifier(
             }
         }
         AtomOperatorToken::EuclidRot => {
-            let Some(ContainerSurfaceTile::Atom(AtomTile::Scalar(steps))) = stack.get(*index + 2) else {
+            let Some(ContainerSurfaceTile::Atom(AtomTile::Scalar(steps))) = stack.get(*index + 2)
+            else {
                 diagnostics.push(Diagnostic::new(
                     DiagnosticCategory::LocalGrammar,
                     DiagnosticKind::OperatorWithoutRightScalar,
@@ -343,9 +382,15 @@ fn build_modifier(
                     next_location.clone(),
                 ));
                 *index += 2;
-                return AtomModifier::EuclidRot { pulses: 1, steps: 1, rotation: 0 };
+                return AtomModifier::EuclidRot {
+                    pulses: 1,
+                    steps: 1,
+                    rotation: 0,
+                };
             };
-            let Some(ContainerSurfaceTile::Atom(AtomTile::Scalar(rotation))) = stack.get(*index + 3) else {
+            let Some(ContainerSurfaceTile::Atom(AtomTile::Scalar(rotation))) =
+                stack.get(*index + 3)
+            else {
                 diagnostics.push(Diagnostic::new(
                     DiagnosticCategory::LocalGrammar,
                     DiagnosticKind::OperatorWithoutRightScalar,
@@ -353,7 +398,11 @@ fn build_modifier(
                     next_location.clone(),
                 ));
                 *index += 3;
-                return AtomModifier::EuclidRot { pulses: 1, steps: 1, rotation: 0 };
+                return AtomModifier::EuclidRot {
+                    pulses: 1,
+                    steps: 1,
+                    rotation: 0,
+                };
             };
             if scalar.denominator != 1
                 || steps.value.denominator != 1
@@ -376,7 +425,9 @@ fn build_modifier(
                 rotation: rotation.value.numerator as i32,
             }
         }
-        AtomOperatorToken::Degrade | AtomOperatorToken::Choice | AtomOperatorToken::Parallel => unreachable!(),
+        AtomOperatorToken::Degrade | AtomOperatorToken::Choice | AtomOperatorToken::Parallel => {
+            unreachable!()
+        }
     };
     modifier
 }
@@ -407,9 +458,7 @@ pub fn normalize_program(program: &TesseraProgram) -> Result<NormalizedProgram, 
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::domain::{
-        AtomExprKind, Container, ContainerKind, NoteAtom, ScalarAtom,
-    };
+    use crate::domain::{AtomExprKind, Container, ContainerKind, NoteAtom, ScalarAtom};
 
     use super::*;
 
@@ -419,9 +468,9 @@ mod tests {
         let mut containers = BTreeMap::new();
         containers.insert(
             container_id.clone(),
-            Container {
-                kind: ContainerKind::Sequence,
-                stack: vec![
+            Container::new(
+                ContainerKind::Sequence,
+                vec![
                     ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new("e"))),
                     ContainerSurfaceTile::Atom(AtomTile::Operator(AtomOperatorToken::Elongate)),
                     ContainerSurfaceTile::Atom(AtomTile::Scalar(ScalarAtom::integer(4))),
@@ -433,7 +482,7 @@ mod tests {
                     ContainerSurfaceTile::Atom(AtomTile::Operator(AtomOperatorToken::Choice)),
                     ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new("g"))),
                 ],
-            },
+            ),
         );
 
         let normalized = normalize_container(

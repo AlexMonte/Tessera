@@ -277,7 +277,9 @@ fn validate_no_socket_group_collision<'a>(
 
 fn validate_socket_defaults(sockets: &[InputSocketSpec]) -> Result<(), String> {
     for socket in sockets {
-        if let Some(default) = &socket.default && default.shape() != socket.shape {
+        if let Some(default) = &socket.default
+            && default.shape() != socket.shape
+        {
             return Err(format!(
                 "default stream for socket '{}' does not match declared shape",
                 socket.port.0
@@ -429,36 +431,37 @@ fn default_transform_signature(kind: TransformKind) -> NodeSignature {
             }],
             ..NodeSignature::default()
         },
-        TransformKind::Transpose | TransformKind::Gain | TransformKind::Attack | TransformKind::Degrade => {
-            NodeSignature {
-                input_sockets: vec![
-                    InputSocketSpec {
-                        port: InputPort::new("main"),
-                        role: NodeInputRole::Main,
-                        shape: StreamShape::EventPattern,
-                        connection: ConnectionRule::Required,
-                        side: Some(Side::Left),
-                        default: None,
-                    },
-                    InputSocketSpec {
-                        port: InputPort::new("amount"),
-                        role: NodeInputRole::Aux,
-                        shape: StreamShape::ScalarPattern,
-                        connection: ConnectionRule::Optional,
-                        side: Some(Side::Top),
-                        default: Some(DefaultStreamBehavior::ConstantScalar {
-                            value: Rational::from_integer(1),
-                        }),
-                    },
-                ],
-                output_sockets: vec![OutputSocketSpec {
-                    port: OutputPort::new("out"),
+        TransformKind::Transpose
+        | TransformKind::Gain
+        | TransformKind::Attack
+        | TransformKind::Degrade => NodeSignature {
+            input_sockets: vec![
+                InputSocketSpec {
+                    port: InputPort::new("main"),
+                    role: NodeInputRole::Main,
                     shape: StreamShape::EventPattern,
-                    side: Some(Side::Right),
-                }],
-                ..NodeSignature::default()
-            }
-        }
+                    connection: ConnectionRule::Required,
+                    side: Some(Side::Left),
+                    default: None,
+                },
+                InputSocketSpec {
+                    port: InputPort::new("amount"),
+                    role: NodeInputRole::Aux,
+                    shape: StreamShape::ScalarPattern,
+                    connection: ConnectionRule::Optional,
+                    side: Some(Side::Top),
+                    default: Some(DefaultStreamBehavior::ConstantScalar {
+                        value: Rational::from_integer(1),
+                    }),
+                },
+            ],
+            output_sockets: vec![OutputSocketSpec {
+                port: OutputPort::new("out"),
+                shape: StreamShape::EventPattern,
+                side: Some(Side::Right),
+            }],
+            ..NodeSignature::default()
+        },
     }
 }
 

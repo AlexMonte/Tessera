@@ -21,6 +21,10 @@ pub enum DiagnosticCategory {
 pub enum DiagnosticKind {
     AtomAtRoot,
     MissingContainer,
+    MissingPlacement,
+    UnknownPlacedNode,
+    OverlappingPlacement,
+    UnknownBindingNode,
     TransformInsideContainer,
     OutputInsideContainer,
     DanglingScalar,
@@ -61,11 +65,25 @@ pub enum DiagnosticKind {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DiagnosticLocation {
     RootNode(NodeId),
-    RootRelation { index: usize },
-    ContainerStack { container: ContainerId, index: usize },
-    TransformSide { node: NodeId, side: Side },
-    InputEndpoint { node: NodeId, endpoint: InputEndpoint },
-    OutputEndpoint { node: NodeId, endpoint: OutputEndpoint },
+    RootRelation {
+        index: usize,
+    },
+    ContainerStack {
+        container: ContainerId,
+        index: usize,
+    },
+    TransformSide {
+        node: NodeId,
+        side: Side,
+    },
+    InputEndpoint {
+        node: NodeId,
+        endpoint: InputEndpoint,
+    },
+    OutputEndpoint {
+        node: NodeId,
+        endpoint: OutputEndpoint,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

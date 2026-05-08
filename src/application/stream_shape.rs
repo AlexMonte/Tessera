@@ -8,8 +8,14 @@ pub fn stream_shape_compatible(source: StreamShape, target: StreamShape) -> bool
     matches!(target, StreamShape::Any)
         || matches!(source, StreamShape::Any)
         || source == target
-        || matches!((source, target), (StreamShape::NotePattern, StreamShape::EventPattern))
-        || matches!((source, target), (StreamShape::ScalarPattern, StreamShape::ControlPattern))
+        || matches!(
+            (source, target),
+            (StreamShape::NotePattern, StreamShape::EventPattern)
+        )
+        || matches!(
+            (source, target),
+            (StreamShape::ScalarPattern, StreamShape::ControlPattern)
+        )
 }
 
 pub fn infer_normalized_container_shape(
@@ -109,7 +115,10 @@ fn merge_expr_shapes(shapes: Vec<StreamShape>) -> StreamShape {
     if shapes.is_empty() {
         return StreamShape::Any;
     }
-    if shapes.iter().all(|shape| matches!(shape, StreamShape::ScalarPattern)) {
+    if shapes
+        .iter()
+        .all(|shape| matches!(shape, StreamShape::ScalarPattern))
+    {
         return StreamShape::ScalarPattern;
     }
     if shapes

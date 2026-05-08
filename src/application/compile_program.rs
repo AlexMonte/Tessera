@@ -6,8 +6,8 @@ use crate::application::{
 };
 use crate::domain::{
     CycleDuration, CycleSpan, CycleTime, Diagnostic, InputEndpoint, NodeId, NormalizedProgram,
-    OutputEndpoint, OutputPort, PatternIr, PatternOutput, PatternStream, PortGroupId,
-    RootRelation, RootSurfaceNodeKind, StreamSource, StreamTarget, TesseraProgram,
+    OutputEndpoint, OutputPort, PatternIr, PatternOutput, PatternStream, PortGroupId, RootRelation,
+    RootSurfaceNodeKind, StreamSource, StreamTarget, TesseraProgram,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -25,7 +25,9 @@ pub fn compile_program(program: &TesseraProgram) -> Result<PatternIr, Vec<Diagno
     compile_normalized_program(&normalized)
 }
 
-pub fn compile_normalized_program(program: &NormalizedProgram) -> Result<PatternIr, Vec<Diagnostic>> {
+pub fn compile_normalized_program(
+    program: &NormalizedProgram,
+) -> Result<PatternIr, Vec<Diagnostic>> {
     let mut cache = BTreeMap::new();
     let mut visiting = BTreeSet::new();
     let mut outputs = Vec::new();
@@ -60,17 +62,21 @@ pub fn compile_container_preview(
     span: CycleSpan,
 ) -> Result<PatternStream, Vec<Diagnostic>> {
     let normalized_program = normalize_program(program)?;
-    let normalized = normalized_program.containers.get(&container_id).cloned().ok_or_else(|| {
-        vec![Diagnostic::new(
-            crate::domain::DiagnosticCategory::Placement,
-            crate::domain::DiagnosticKind::MissingContainer,
-            "Container preview target is missing from normalized program.",
-            Some(crate::domain::DiagnosticLocation::ContainerStack {
-                container: container_id.clone(),
-                index: 0,
-            }),
-        )]
-    })?;
+    let normalized = normalized_program
+        .containers
+        .get(&container_id)
+        .cloned()
+        .ok_or_else(|| {
+            vec![Diagnostic::new(
+                crate::domain::DiagnosticCategory::Placement,
+                crate::domain::DiagnosticKind::MissingContainer,
+                "Container preview target is missing from normalized program.",
+                Some(crate::domain::DiagnosticLocation::ContainerStack {
+                    container: container_id.clone(),
+                    index: 0,
+                }),
+            )]
+        })?;
     compile_container(&normalized_program, &normalized, span, 0)
 }
 
@@ -80,7 +86,13 @@ fn compile_source(
     cache: &mut BTreeMap<NodeOutputKey, PatternStream>,
     visiting: &mut BTreeSet<NodeOutputKey>,
 ) -> Result<PatternStream, Vec<Diagnostic>> {
-    compile_node_output(program, source.node.clone(), source.endpoint.clone(), cache, visiting)
+    compile_node_output(
+        program,
+        source.node.clone(),
+        source.endpoint.clone(),
+        cache,
+        visiting,
+    )
 }
 
 fn compile_node_output(
@@ -122,7 +134,9 @@ fn compile_node_output(
             crate::domain::DiagnosticCategory::Compile,
             crate::domain::DiagnosticKind::CompileFailed,
             "Compiled node did not produce the requested output endpoint.",
-            Some(crate::domain::DiagnosticLocation::RootNode(key.node.clone())),
+            Some(crate::domain::DiagnosticLocation::RootNode(
+                key.node.clone(),
+            )),
         )]
     })
 }
@@ -165,14 +179,18 @@ fn compile_container_outputs(
     cache: &mut BTreeMap<NodeOutputKey, PatternStream>,
     visiting: &mut BTreeSet<NodeOutputKey>,
 ) -> Result<NodeOutputs, Vec<Diagnostic>> {
-    let normalized = program.containers.get(container_id).cloned().ok_or_else(|| {
-        vec![Diagnostic::new(
-            crate::domain::DiagnosticCategory::Placement,
-            crate::domain::DiagnosticKind::MissingContainer,
-            "Container is missing from normalized program.",
-            Some(crate::domain::DiagnosticLocation::RootNode(node_id.clone())),
-        )]
-    })?;
+    let normalized = program
+        .containers
+        .get(container_id)
+        .cloned()
+        .ok_or_else(|| {
+            vec![Diagnostic::new(
+                crate::domain::DiagnosticCategory::Placement,
+                crate::domain::DiagnosticKind::MissingContainer,
+                "Container is missing from normalized program.",
+                Some(crate::domain::DiagnosticLocation::RootNode(node_id.clone())),
+            )]
+        })?;
     let mut stream = compile_container(
         program,
         &normalized,
@@ -226,7 +244,11 @@ fn compile_flow_control_outputs(
     })
 }
 
-fn incoming_output_group_sources(program: &NormalizedProgram, node_id: &NodeId, group: &PortGroupId) -> Vec<StreamSource> {
+fn incoming_output_group_sources(
+    program: &NormalizedProgram,
+    node_id: &NodeId,
+    group: &PortGroupId,
+) -> Vec<StreamSource> {
     let mut sources = Vec::new();
     for relation in &program.relations {
         if let RootRelation::FlowsTo { from, to } = relation
@@ -241,7 +263,9 @@ fn incoming_output_group_sources(program: &NormalizedProgram, node_id: &NodeId, 
 fn incoming_chain_sources(program: &NormalizedProgram, node_id: &NodeId) -> Vec<StreamSource> {
     let mut sources = Vec::new();
     for relation in &program.relations {
-        if let RootRelation::ChainedTo { from, to } = relation && to == node_id {
+        if let RootRelation::ChainedTo { from, to } = relation
+            && to == node_id
+        {
             sources.push(from.clone());
         }
     }

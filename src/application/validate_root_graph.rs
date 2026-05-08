@@ -35,7 +35,9 @@ pub fn validate_root_graph(program: &TesseraProgram) -> Vec<Diagnostic> {
 pub fn incoming_chain_sources(program: &TesseraProgram, node_id: &NodeId) -> Vec<StreamSource> {
     let mut sources = Vec::new();
     for relation in &program.relations {
-        if let RootRelation::ChainedTo { from, to } = relation && to == node_id {
+        if let RootRelation::ChainedTo { from, to } = relation
+            && to == node_id
+        {
             sources.push(from.clone());
         }
     }
@@ -164,7 +166,9 @@ fn validate_relations(program: &TesseraProgram, diagnostics: &mut Vec<Diagnostic
     for (index, relation) in program.relations.iter().enumerate() {
         match relation {
             RootRelation::ChainedTo { from, to } => {
-                if !source_endpoint_exists(program, from) || !node_resolves_to_stream(program, &from.node, &mut BTreeSet::new()) {
+                if !source_endpoint_exists(program, from)
+                    || !node_resolves_to_stream(program, &from.node, &mut BTreeSet::new())
+                {
                     diagnostics.push(Diagnostic::new(
                         DiagnosticCategory::RootRelation,
                         DiagnosticKind::InvalidChainSource,
@@ -175,7 +179,10 @@ fn validate_relations(program: &TesseraProgram, diagnostics: &mut Vec<Diagnostic
                         }),
                     ));
                 }
-                if !matches!(program.root_nodes.get(to), Some(RootSurfaceNodeKind::Container { .. })) {
+                if !matches!(
+                    program.root_nodes.get(to),
+                    Some(RootSurfaceNodeKind::Container { .. })
+                ) {
                     diagnostics.push(Diagnostic::new(
                         DiagnosticCategory::RootRelation,
                         DiagnosticKind::InvalidChainTarget,
@@ -240,7 +247,9 @@ fn validate_flow_relation(
     index: usize,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    if !source_endpoint_exists(program, from) || !node_resolves_to_stream(program, &from.node, &mut BTreeSet::new()) {
+    if !source_endpoint_exists(program, from)
+        || !node_resolves_to_stream(program, &from.node, &mut BTreeSet::new())
+    {
         diagnostics.push(Diagnostic::new(
             DiagnosticCategory::RootRelation,
             DiagnosticKind::InvalidFlowSource,
@@ -261,7 +270,9 @@ fn validate_flow_relation(
         StreamTarget::FlowControlInput { node, endpoint } => {
             (node, endpoint, DiagnosticCategory::FlowControlTopology)
         }
-        StreamTarget::OutputInput { node, endpoint } => (node, endpoint, DiagnosticCategory::RootRelation),
+        StreamTarget::OutputInput { node, endpoint } => {
+            (node, endpoint, DiagnosticCategory::RootRelation)
+        }
     };
 
     let Some(_signature) = target_signature(program, target_node) else {
@@ -339,7 +350,10 @@ fn validate_node_bindings(
                     endpoint: InputEndpoint::Socket(socket.port.clone()),
                 }),
             ));
-        } else if matches!(socket.connection, ConnectionRule::Required) && !resolves && socket.default.is_none() {
+        } else if matches!(socket.connection, ConnectionRule::Required)
+            && !resolves
+            && socket.default.is_none()
+        {
             diagnostics.push(Diagnostic::new(
                 category,
                 DiagnosticKind::RequiredSocketMissing,
@@ -476,11 +490,18 @@ fn source_endpoint_exists(program: &TesseraProgram, source: &StreamSource) -> bo
     }
 }
 
-fn source_endpoint_shape(program: &TesseraProgram, source: &StreamSource) -> crate::domain::StreamShape {
+fn source_endpoint_shape(
+    program: &TesseraProgram,
+    source: &StreamSource,
+) -> crate::domain::StreamShape {
     match program.root_nodes.get(&source.node) {
         Some(RootSurfaceNodeKind::Container { .. }) => crate::domain::StreamShape::Any,
-        Some(RootSurfaceNodeKind::Transform(transform)) => endpoint_shape_from_outputs(&transform.signature, &source.endpoint),
-        Some(RootSurfaceNodeKind::FlowControl(control)) => endpoint_shape_from_outputs(&control.signature, &source.endpoint),
+        Some(RootSurfaceNodeKind::Transform(transform)) => {
+            endpoint_shape_from_outputs(&transform.signature, &source.endpoint)
+        }
+        Some(RootSurfaceNodeKind::FlowControl(control)) => {
+            endpoint_shape_from_outputs(&control.signature, &source.endpoint)
+        }
         Some(RootSurfaceNodeKind::Output(_)) | None => crate::domain::StreamShape::Any,
     }
 }
@@ -580,7 +601,10 @@ fn build_adjacency(relations: &[RootRelation]) -> BTreeMap<NodeId, Vec<NodeId>> 
     for relation in relations {
         match relation {
             RootRelation::ChainedTo { from, to } => {
-                adjacency.entry(from.node.clone()).or_default().push(to.clone());
+                adjacency
+                    .entry(from.node.clone())
+                    .or_default()
+                    .push(to.clone());
             }
             RootRelation::FlowsTo { from, to } => {
                 let target = match to {
@@ -588,7 +612,10 @@ fn build_adjacency(relations: &[RootRelation]) -> BTreeMap<NodeId, Vec<NodeId>> 
                     StreamTarget::TransformInput { node, .. } => node,
                     StreamTarget::FlowControlInput { node, .. } => node,
                 };
-                adjacency.entry(from.node.clone()).or_default().push(target.clone());
+                adjacency
+                    .entry(from.node.clone())
+                    .or_default()
+                    .push(target.clone());
             }
         }
     }

@@ -35,6 +35,14 @@ pub struct Container {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stack: Vec<ContainerSurfaceTile>,
 }
+impl Container {
+    pub fn new(kind: ContainerKind, stack: Vec<ContainerSurfaceTile>) -> Self {
+        Self { kind, stack }
+    }
+    pub fn kind(&self) -> ContainerKind {
+        self.kind
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NormalizedContainer {
@@ -42,4 +50,10 @@ pub struct NormalizedContainer {
     pub kind: ContainerKind,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exprs: Vec<AtomExpr>,
+}
+
+impl NormalizedContainer {
+    pub fn new(id: ContainerId, kind: ContainerKind, exprs: Vec<AtomExpr>) -> Self {
+        Self { id, kind, exprs }
+    }
 }
