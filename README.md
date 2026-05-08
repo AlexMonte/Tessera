@@ -1,160 +1,600 @@
 # Tessera
 
-Tessera is a graph-analysis kernel for tile-based editors.
+Tessera is a Rust library for authoring, validating, and compiling spatial music-pattern programs into a typed `PatternIr`.
 
-A host application defines pieces, users arrange them on a grid, and Tessera
-turns that editable graph into stable semantic facts:
+Tessera treats musical structure as authored tile structure. The default authoring mode is **spatial source mode**, where root tiles have logical board positions and directional input/output bindings. Touching tiles can resolve into stream relations when their sides and endpoint shapes are compatible.
 
-- which nodes are explicit output roots
-- which source feeds each input
-- which effective types were inferred
-- where domain bridges are needed
-- which edges behave like delay feedback
-- what subgraph boundaries expose to the host
+Tessera also exposes an optional **explicit graph mode** for tools that want to construct endpoint relations directly.
 
-The host crate then walks those facts and lowers them into its own
-representation.
+## What Tessera provides
 
-## What Tessera Owns
+Tessera is not an audio engine. It does not synthesize sound directly.
+## What Tessera Is
 
-- Graph structure and mutation ops
-- Piece catalogs and graph typing rules
-- Validation and deterministic semantic analysis
-- Connection probing and repair hints
-- Subgraph boundary analysis
+Tessera is a Rust crate for building musical patterns from tile structure.
 
-## What The Host Owns
+Instead of treating music patterns as strings, Tessera treats them as authored structures: tiles placed on a surface, containers filled with musical atoms, and streams shaped through spatial relationships. This makes it useful for visual music tools, live-coding experiments, pattern editors, procedural composition systems, and any project that wants music to be represented as structured data instead of fragile text.
 
-- Project documents and persistence
-- Domain-specific piece meaning
-- Lowering from `AnalyzedGraph` into the app's own representation
-- Execution policy and scheduling
-- Preview, probe, and activity/telemetry representations
-- External resources and side effects
+Tessera is built around one core idea:
 
-## Quick Start
+> Musical patterns can be authored as tile arrangements, then compiled into precise rational-time events.
 
-Add Tessera as a dependency:
+A Tessera program can describe:
+
+- phrases made from notes, rests, numbers, operators, and nested containers
+- musical timing created by container rules such as sequence, alternate, and layer
+- spatial root-surface layouts where touching tiles can imply stream flow
+- transforms such as slow, fast, reverse, gain, attack, transpose, and degrade
+- flow-control structures such as layer, split, route, mask, switch, merge, mix, and choice
+- final outputs compiled into `PatternIr`
+
+The crate can be used in two ways:
+
+1. **Spatial source mode**  
+   The intended tile-authored mode. You place tiles on a logical board, assign endpoints to sides, and let Tessera resolve neighboring tiles into stream relations.
+
+2. **Explicit graph mode**  
+   An advanced mode for tools, importers, text frontends, procedural generation, and tests. You construct the stream graph directly.
+
+Both modes compile into the same rational-time `PatternIr`.
+## What the Crate Provides
+
+Internally, Tessera provides:
+
+- a domain model for tile-authored musical programs
+- spatial root-surface authoring
+- container-local pattern stacks
+- endpoint and port-shape validation
+- normalization from raw tile stacks into musical expressions
+- graph resolution from spatial tile placement into explicit stream relations
+- compilation into rational-time `PatternIr`
+- ergonomic infrastructure helpers for common authoring workflows
+- 
+The normal pipeline is:
+
+```text
+authored spatial program
+    -> resolved graph program
+    -> validated program
+    -> normalized containers
+    -> compiled pattern streams
+    -> PatternIr
+```
+
+## Authoring modes
+
+Tessera supports two authoring modes.
+
+### 1. Spatial source mode
+
+Spatial source mode is the default public authoring surface.
+
+Use this when you want Tessera’s tile-native behavior:
+
+```text
+placed tiles
++ directional endpoint bindings
++ container stacks
++ optional explicit relations
+```
+
+In this mode, root tiles live on a logical board. Each tile has spatial bindings that assign input and output endpoints to sides such as west, east, north, south, or off.
+
+For example, if a container’s output faces east and an output tile’s input faces west, placing them next to each other resolves into a `FlowsTo` relation.
+
+```text
+[ phrase ][ out ]
+```
+
+resolves to:
+
+```text
+phrase.out -> out.inputs.main
+```
+
+### 2. Explicit graph mode
+
+Explicit graph mode is the lower-level endpoint graph representation.
+
+Use this for:
+
+- generated programs
+- text-language frontends
+- tests
+- import/export tools
+- advanced graph construction
+
+Graph mode is available behind the `graph` feature.
+
+## Installation
+
+Tessera is currently a local/private crate. Add it as a path dependency:
 
 ```toml
 [dependencies]
 tessera = { path = "../tessera" }
-serde_json = "1"
 ```
 
-Define a piece catalog:
+Default features include spatial authoring helpers:
+
+```toml
+[features]
+default = ["spatial", "builders"]
+```
+
+To enable explicit graph authoring helpers:
+
+```toml
+[dependencies]
+tessera = { path = "../tessera", features = ["graph"] }
+```
+
+## Quick start: spatial authoring
 
 ```rust
-use tessera::*;
+use tessera::prelude::*;
 
-struct NotePiece {
-    def: PieceDef,
-}
+fn main() -> Result<(), Vec<Diagnostic>> {
+    let mut program = AuthoredTesseraProgram::empty();
 
-impl NotePiece {
-    fn new() -> Self {
-        Self {
-            def: PieceDef {
-                id: "demo.text_literal".into(),
-                label: "text".into(),
-                category: PieceCategory::Generator,
-                semantic_kind: PieceSemanticKind::Literal,
-                namespace: "demo".into(),
-                params: vec![],
-                output_type: Some(PortType::text()),
-                output_side: Some(TileSide::RIGHT),
-                output_role: Default::default(),
-                description: Some("A text value.".into()),
-                tags: vec!["demo".into()],
-            },
-        }
-    }
-}
+    program
+        .place_sequence("phrase", slot(0, 0), notes(["a", "b", "c", "d"]))
+        .place_output("out", slot(1, 0));
 
-impl Piece for NotePiece {
-    fn def(&self) -> &PieceDef {
-        &self.def
-    }
+    let ir = TesseraCompiler::new().compile_authored_ir(&program)?;
+
+    println!("{ir:#?}");
+
+    Ok(())
 }
 ```
 
-Build a registry and analyze a graph directly:
+This creates a spatial board equivalent to:
+
+```text
+[ phrase ][ out ]
+```
+
+The compiler resolves that adjacency into a stream relation, validates it, normalizes the container, and emits `PatternIr`.
+
+## Containers
+
+Containers build local musical phrases.
+
+A container owns a stack of local tiles such as notes, rests, scalars, operators, and nested containers.
 
 ```rust
-use tessera::*;
+let stack = notes(["a", "b", "c"]);
+```
 
-let mut registry = PieceRegistry::new();
-registry.register(NotePiece::new());
+```rust
+program.place_sequence("phrase", slot(0, 0), stack);
+```
 
-let analyzed = semantic_pass(&graph, &registry);
+The main container kinds are:
 
-if analyzed.is_valid() {
-    for (output_pos, output_node) in analyzed.output_nodes() {
-        let _site = output_pos;
-        let _piece = &output_node.piece_id;
+- `Sequence`: divides its span across expressions in order
+- `Alternate`: chooses one expression per cycle
+- `Layer`: places expressions over the same span
 
-        // Walk the output roots and lower from resolved inputs into your host.
+## Stack helpers
+
+The infrastructure layer provides helpers for authoring container stacks:
+
+```rust
+use tessera::prelude::*;
+
+let phrase = stack(vec![
+    note("e"),
+    op(AtomOperatorToken::Elongate),
+    scalar(4),
+    note("g"),
+]);
+```
+
+You can also use the simple note-list helper:
+
+```rust
+let phrase = notes(["a", "b", "c", "d"]);
+```
+
+Available stack helpers include:
+
+```rust
+note("a")
+rest()
+scalar(2)
+op(AtomOperatorToken::Slow)
+nested("child_container")
+notes(["a", "b", "c"])
+```
+
+## Spatial source concepts
+
+Spatial source mode uses these core types:
+
+```rust
+AuthoredTesseraProgram
+RootSurface
+RootPlacement
+BoardSlot
+TileFootprint
+SpatialSide
+NodeSpatialBindings
+```
+
+An authored program contains:
+
+```rust
+pub struct AuthoredTesseraProgram {
+    pub root_surface: RootSurface,
+    pub containers: BTreeMap<ContainerId, Container>,
+}
+```
+
+A root surface contains:
+
+```rust
+pub struct RootSurface {
+    pub nodes: BTreeMap<NodeId, RootSurfaceNodeKind>,
+    pub placements: BTreeMap<NodeId, RootPlacement>,
+    pub bindings: BTreeMap<NodeId, NodeSpatialBindings>,
+    pub explicit_relations: Vec<RootRelation>,
+}
+```
+
+This means Tessera’s spatial source model is made from:
+
+- root nodes
+- logical board placement
+- endpoint side bindings
+- optional explicit endpoint relations
+- container-local stacks
+
+## Directional endpoint bindings
+
+Each tile can bind its inputs and outputs to spatial sides.
+
+```rust
+SpatialSide::North
+SpatialSide::South
+SpatialSide::West
+SpatialSide::East
+SpatialSide::Off
+```
+
+For example, transforms commonly use:
+
+```text
+main input  -> West
+aux input   -> North
+out output  -> East
+```
+
+A simple transform chain can be written as:
+
+```rust
+use tessera::prelude::*;
+
+fn main() -> Result<(), Vec<Diagnostic>> {
+    let mut program = AuthoredTesseraProgram::empty();
+
+    program
+        .place_sequence("phrase", slot(0, 0), notes(["a", "b", "c", "d"]))
+        .place_transform("slow", slot(1, 0), TransformKind::Slow)
+        .place_output("out", slot(2, 0));
+
+    let ir = TesseraCompiler::new().compile_authored_ir(&program)?;
+
+    println!("{ir:#?}");
+
+    Ok(())
+}
+```
+
+This board:
+
+```text
+[ phrase ][ slow ][ out ]
+```
+
+resolves to:
+
+```text
+phrase.out -> slow.main
+slow.out   -> out.inputs.main
+```
+
+## Binding control inputs
+
+Some transforms and flow-control tiles use auxiliary or control inputs.
+
+For example, `Slow` has a `factor` input. By default, that input faces north. If a scalar-producing container is placed above `slow`, its output must face south to feed that input.
+
+```rust
+use tessera::prelude::*;
+
+fn main() -> Result<(), Vec<Diagnostic>> {
+    let mut program = AuthoredTesseraProgram::empty();
+
+    program
+        .place_sequence("phrase", slot(0, 1), notes(["a", "b", "c", "d"]))
+        .place_sequence("factor", slot(1, 0), vec![scalar(2)])
+        .place_transform("slow", slot(1, 1), TransformKind::Slow)
+        .place_output("out", slot(2, 1));
+
+    program.bind_output_side(
+        "factor",
+        out_output(),
+        SpatialSide::South,
+    );
+
+    let ir = TesseraCompiler::new().compile_authored_ir(&program)?;
+
+    println!("{ir:#?}");
+
+    Ok(())
+}
+```
+
+The logical board is:
+
+```text
+          [ factor ]
+[ phrase ][ slow   ][ out ]
+```
+
+The resolved graph is:
+
+```text
+phrase.out -> slow.main
+factor.out -> slow.factor
+slow.out   -> out.inputs.main
+```
+
+## Ports and endpoint helpers
+
+Tessera exposes endpoint helper functions for common bindings.
+
+```rust
+input("main")
+output("out")
+input_member("inputs", "main")
+output_member("branches", "even")
+```
+
+Common shortcuts include:
+
+```rust
+main_input()
+factor_input()
+amount_input()
+mask_input()
+control_input()
+out_output()
+inputs_member("main")
+streams_member("a")
+branches_member("even")
+routes_member("drums")
+```
+
+These helpers return `InputEndpoint` or `OutputEndpoint` values used by side bindings and explicit graph relations.
+
+## Explicit relations
+
+Spatial adjacency is not the only way to author relationships.
+
+An authored spatial program may also contain explicit endpoint relations. These are useful for long-distance connections, manual routing, generated structures, or cases where adjacency would be ambiguous.
+
+```rust
+program.add_explicit_relation(RootRelation::FlowsTo {
+    from: StreamSource::node(NodeId::new("phrase")),
+    to: StreamTarget::OutputInput {
+        node: NodeId::new("out"),
+        endpoint: inputs_member("main"),
+    },
+});
+```
+
+Explicit relations and spatially inferred relations both lower into the same resolved graph representation before validation and compilation.
+
+## Flow-control tiles
+
+Flow-control tiles shape stream topology.
+
+Available flow-control kinds include:
+
+- `Layer`
+- `Merge`
+- `Mix`
+- `Split`
+- `Mask`
+- `Switch`
+- `Route`
+- `Choice`
+
+Examples of flow-control behavior:
+
+```text
+Layer  -> overlays streams
+Split  -> produces named output branches
+Mask   -> gates or shapes a main stream with a control stream
+Route  -> sends events into named output routes
+Choice -> selects one stream from alternatives
+```
+
+Spatial source mode can place flow-control tiles:
+
+```rust
+program.place_layer("drums", slot(1, 0), ["kick", "snare"]);
+```
+
+For v1 spatial resolution, normal 1x1 side adjacency is supported. More complex flow-tile lane geometry can be layered on top of `TileFootprint` and endpoint bindings.
+
+For precise flow-control routing, explicit relations remain available.
+
+## Compiler API
+
+The main compiler facade is `TesseraCompiler`.
+
+### Compile a spatial authored program
+
+```rust
+let ir = TesseraCompiler::new().compile_authored_ir(&program)?;
+```
+
+### Resolve spatial source into explicit graph form
+
+```rust
+let graph = TesseraCompiler::new().resolve(&program)?;
+```
+
+### Validate a spatial authored program
+
+```rust
+let report = TesseraCompiler::new().validate_authored(&program);
+
+if !report.valid {
+    for diagnostic in report.diagnostics {
+        eprintln!("{diagnostic:?}");
     }
 }
 ```
 
-## The Main Contract
+### Compile and keep intermediate data
 
-The stable host-facing contract is:
+```rust
+let report = TesseraCompiler::new().compile_authored(&program)?;
 
-- `AnalyzedGraph`
-- `AnalyzedNode`
-- `ResolvedInput`
-- `ResolvedInputSource`
-- `AnalysisCache`
-- `SubgraphInput`
-- `SubgraphSignature`
+let normalized = report.normalized;
+let ir = report.ir;
+```
 
-That surface is meant to be enough for a host crate to do its own lowering
-without Tessera knowing the target host representation.
+## Explicit graph mode
 
-## What Tessera Gives You
+Explicit graph mode is available with the `graph` feature.
 
-- A typed tile grid with adjacency and side rules
-- Deterministic output roots and evaluation order
-- Per-input source resolution for edge, inline, default, and missing values
-- Effective type inference and domain bridge metadata
-- Native port matching based on exact type identity, `any`, and supported domain bridges
-- Delay-edge classification for feedback flows
-- Connector traversal that normalizes pass-through routing into real upstream sources
-- Piece-local semantic diagnostics over normalized analyzed nodes
-- Connection probing with human-readable repair suggestions
-- Subgraph signatures that describe reusable boundaries
-- Incremental analysis caching across graph edits
-- Full serde support for public graph and analysis types
+```toml
+[dependencies]
+tessera = { path = "../tessera", features = ["graph"] }
+```
 
-Placed nodes must keep each input side unique. Tessera rejects edits that
-assign multiple params on the same node to the same side, and persisted graphs
-that violate that rule analyze with explicit diagnostics.
+Graph mode uses the lower-level `TesseraProgram` representation:
 
-Piece implementations can also add read-only semantic diagnostics during
-analysis through `Piece::validate_analysis`. That hook receives the final
-normalized `AnalyzedNode`, so host crates can express piece-specific invariants
-without pulling host-specific concerns into Tessera itself.
+```rust
+pub struct TesseraProgram {
+    pub root_nodes: BTreeMap<NodeId, RootSurfaceNodeKind>,
+    pub containers: BTreeMap<ContainerId, Container>,
+    pub relations: Vec<RootRelation>,
+}
+```
 
-Connector pieces are also first-class in analysis. When a piece is marked as a
-connector, Tessera treats single-input connector chains as transparent during
-source resolution, type checks, bridge detection, and connection probing. Edge
-sources can therefore report the real upstream producer plus any traversed
-connector positions in `ResolvedInputSource::Edge.via`.
+This is useful when building programs from a text parser, procedural generator, import tool, or low-level test.
 
-## Subgraphs
+```rust
+use tessera::graph_prelude::*;
+use tessera::prelude::*;
 
-Use `analyze_subgraph` to turn a subgraph definition into a stable signature.
-Use `subgraph_editor_pieces` for boundary marker pieces in an editor, and
-`subgraph_pieces` when you want reusable piece definitions from saved
-signatures.
+let mut graph = TesseraProgram::empty();
 
-## Design Note
+graph
+    .add_sequence("phrase", notes(["a", "b", "c"]))
+    .add_output("out")
+    .connect("phrase", "out");
 
-Tessera may study external systems such as Psi for design inspiration, but the
-crate stays clean-room at the code and API level. Reuse ideas and behaviors,
-not source code, assets, or copied surface design.
+let ir = TesseraCompiler::new().compile_ir(&graph)?;
+```
+
+Graph mode is not the default public identity of Tessera. It is the explicit resolved representation that spatial source mode lowers into.
+
+## Feature flags
+
+```toml
+[features]
+default = ["spatial", "builders"]
+spatial = []
+builders = []
+graph = []
+serde = []
+```
+
+### `spatial`
+
+Enables spatial source authoring types and helpers.
+
+### `builders`
+
+Enables builder-style infrastructure helpers.
+
+### `graph`
+
+Exposes explicit graph authoring helpers and graph prelude.
+
+### `serde`
+
+Reserved for serialization support.
+
+## Diagnostics
+
+Tessera reports validation and compilation failures through `Diagnostic` values.
+
+Diagnostics include:
+
+- placement errors
+- unknown nodes
+- invalid endpoint bindings
+- invalid graph relations
+- missing required inputs
+- wrong stream shape
+- container-local grammar errors
+- invalid transform arguments
+- flow-control topology errors
+
+Use `validate_authored` to inspect errors before compiling:
+
+```rust
+let report = TesseraCompiler::new().validate_authored(&program);
+
+for diagnostic in report.diagnostics {
+    eprintln!("{diagnostic:?}");
+}
+```
+
+## Mental model
+
+Tessera has three layers:
+
+```text
+Spatial source mode:
+  placed tiles + side bindings + container stacks
+
+Resolved graph mode:
+  explicit endpoint relations
+
+Pattern IR:
+  typed rational-time musical events
+```
+
+The spatial source is what authors write.
+The resolved graph is what tools may generate.
+The PatternIR is what runtimes consume.
+
+## Current limitations
+
+The current spatial resolver uses logical board slots and side bindings. It supports common 1x1 adjacency patterns such as:
+
+```text
+[ container ][ transform ][ output ]
+```
+
+and north/south auxiliary inputs such as:
+
+```text
+          [ scalar ]
+[ phrase ][ slow   ][ output ]
+```
+
+More advanced flow-tile lane geometry can be added using `TileFootprint` and endpoint bindings without changing the compiler pipeline.
 
 ## License
 
