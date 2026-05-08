@@ -5,15 +5,17 @@ pub mod flow;
 pub mod pattern_ir;
 pub mod program;
 pub mod relations;
+pub mod spatial_defaults;
+pub mod surface;
 
 pub use atom::{
     AtomExpr, AtomExprKind, AtomModifier, AtomOperatorToken, AtomTile, MusicalValue, NoteAtom,
     ScalarAtom,
 };
-pub use container::{Container, ContainerId, ContainerKind, ContainerSurfaceTile, NormalizedContainer};
-pub use diagnostics::{
-    Diagnostic, DiagnosticCategory, DiagnosticKind, DiagnosticLocation,
+pub use container::{
+    Container, ContainerId, ContainerKind, ContainerSurfaceTile, NormalizedContainer,
 };
+pub use diagnostics::{Diagnostic, DiagnosticCategory, DiagnosticKind, DiagnosticLocation};
 pub use flow::{
     ConnectionRule, DefaultStreamBehavior, FlowControlKind, FlowControlNode, FlowControlPolicy,
     GroupMembers, InputGroupSpec, InputPort, InputSocketSpec, NodeInputRole, NodeSignature,
@@ -26,3 +28,8 @@ pub use pattern_ir::{
 };
 pub use program::{NodeId, NormalizedProgram, TesseraProgram};
 pub use relations::{InputEndpoint, OutputEndpoint, RootRelation, StreamSource, StreamTarget};
+pub use spatial_defaults::{apply_flow_member_default_bindings, default_spatial_bindings};
+pub use surface::{
+    AuthoredTesseraProgram, BoardSlot, NodeSpatialBindings, RootPlacement, RootSurface,
+    SpatialSide, TileFootprint,
+};

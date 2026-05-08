@@ -1,9 +1,10 @@
 use crate::application::{
-    compile_container, compile_normalized_program, normalize_program, validate_program_shape,
+    compile_container, compile_normalized_program, normalize_program, resolve_spatial_program,
+    validate_program_shape,
 };
 use crate::domain::{
-    ContainerId, CycleSpan, Diagnostic, DiagnosticCategory, DiagnosticKind, DiagnosticLocation,
-    NormalizedProgram, PatternIr, TesseraProgram,
+    AuthoredTesseraProgram, ContainerId, CycleSpan, Diagnostic, DiagnosticCategory, DiagnosticKind,
+    DiagnosticLocation, NormalizedProgram, PatternIr, TesseraProgram,
 };
 
 use super::{CompileReport, PreviewReport, ValidationReport};
@@ -91,5 +92,34 @@ impl TesseraCompiler {
         };
         let stream = compile_container(&normalized_program, container, span, 0)?;
         Ok(PreviewReport { stream })
+    }
+
+    pub fn resolve(
+        &self,
+        authored: &AuthoredTesseraProgram,
+    ) -> Result<TesseraProgram, Vec<Diagnostic>> {
+        resolve_spatial_program(authored)
+    }
+
+    pub fn validate_authored(&self, authored: &AuthoredTesseraProgram) -> ValidationReport {
+        match self.resolve(authored) {
+            Ok(resolved) => self.validate(&resolved),
+            Err(diagnostics) => ValidationReport::invalid(diagnostics),
+        }
+    }
+
+    pub fn compile_authored(
+        &self,
+        authored: &AuthoredTesseraProgram,
+    ) -> Result<CompileReport, Vec<Diagnostic>> {
+        let resolved = self.resolve(authored)?;
+        self.compile(&resolved)
+    }
+
+    pub fn compile_authored_ir(
+        &self,
+        authored: &AuthoredTesseraProgram,
+    ) -> Result<PatternIr, Vec<Diagnostic>> {
+        Ok(self.compile_authored(authored)?.ir)
     }
 }

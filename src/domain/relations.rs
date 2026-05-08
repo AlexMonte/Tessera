@@ -61,6 +61,12 @@ pub enum StreamTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RootRelation {
-    ChainedTo { from: StreamSource, to: NodeId },
-    FlowsTo { from: StreamSource, to: StreamTarget },
+    ChainedTo {
+        from: StreamSource,
+        to: NodeId,
+    },
+    FlowsTo {
+        from: StreamSource,
+        to: StreamTarget,
+    },
 }

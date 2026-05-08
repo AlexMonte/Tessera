@@ -24,6 +24,12 @@ pub struct TesseraProgram {
     pub relations: Vec<RootRelation>,
 }
 
+impl TesseraProgram {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct NormalizedProgram {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

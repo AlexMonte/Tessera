@@ -37,12 +37,8 @@ fn validate_normalized_program(program: &NormalizedProgram) -> Vec<Diagnostic> {
             continue;
         };
 
-        let source_shape = normalized_node_output_shape(
-            program,
-            &from.node,
-            &from.endpoint,
-            &mut BTreeSet::new(),
-        );
+        let source_shape =
+            normalized_node_output_shape(program, &from.node, &from.endpoint, &mut BTreeSet::new());
 
         let (accepted_shape, location, message) = match to {
             StreamTarget::OutputInput { node, endpoint } => {
@@ -50,8 +46,12 @@ fn validate_normalized_program(program: &NormalizedProgram) -> Vec<Diagnostic> {
                     continue;
                 };
                 let shape = match endpoint {
-                    InputEndpoint::Socket(port) => output.signature.input_socket(port).map(|spec| spec.shape),
-                    InputEndpoint::GroupMember { group, .. } => output.signature.input_group(group).map(|spec| spec.shape),
+                    InputEndpoint::Socket(port) => {
+                        output.signature.input_socket(port).map(|spec| spec.shape)
+                    }
+                    InputEndpoint::GroupMember { group, .. } => {
+                        output.signature.input_group(group).map(|spec| spec.shape)
+                    }
                 }
                 .unwrap_or(crate::domain::StreamShape::EventPattern);
                 (
@@ -61,32 +61,50 @@ fn validate_normalized_program(program: &NormalizedProgram) -> Vec<Diagnostic> {
                 )
             }
             StreamTarget::TransformInput { node, endpoint } => {
-                let Some(RootSurfaceNodeKind::Transform(transform)) = program.root_nodes.get(node) else {
+                let Some(RootSurfaceNodeKind::Transform(transform)) = program.root_nodes.get(node)
+                else {
                     continue;
                 };
                 let shape = match endpoint {
-                    InputEndpoint::Socket(port) => transform.signature.input_socket(port).map(|spec| spec.shape),
-                    InputEndpoint::GroupMember { group, .. } => transform.signature.input_group(group).map(|spec| spec.shape),
+                    InputEndpoint::Socket(port) => transform
+                        .signature
+                        .input_socket(port)
+                        .map(|spec| spec.shape),
+                    InputEndpoint::GroupMember { group, .. } => transform
+                        .signature
+                        .input_group(group)
+                        .map(|spec| spec.shape),
                 }
                 .unwrap_or(crate::domain::StreamShape::Any);
                 (
                     shape,
-                    DiagnosticLocation::InputEndpoint { node: node.clone(), endpoint: endpoint.clone() },
+                    DiagnosticLocation::InputEndpoint {
+                        node: node.clone(),
+                        endpoint: endpoint.clone(),
+                    },
                     "Transform input received an incompatible upstream stream shape after normalization.",
                 )
             }
             StreamTarget::FlowControlInput { node, endpoint } => {
-                let Some(RootSurfaceNodeKind::FlowControl(control)) = program.root_nodes.get(node) else {
+                let Some(RootSurfaceNodeKind::FlowControl(control)) = program.root_nodes.get(node)
+                else {
                     continue;
                 };
                 let shape = match endpoint {
-                    InputEndpoint::Socket(port) => control.signature.input_socket(port).map(|spec| spec.shape),
-                    InputEndpoint::GroupMember { group, .. } => control.signature.input_group(group).map(|spec| spec.shape),
+                    InputEndpoint::Socket(port) => {
+                        control.signature.input_socket(port).map(|spec| spec.shape)
+                    }
+                    InputEndpoint::GroupMember { group, .. } => {
+                        control.signature.input_group(group).map(|spec| spec.shape)
+                    }
                 }
                 .unwrap_or(crate::domain::StreamShape::Any);
                 (
                     shape,
-                    DiagnosticLocation::InputEndpoint { node: node.clone(), endpoint: endpoint.clone() },
+                    DiagnosticLocation::InputEndpoint {
+                        node: node.clone(),
+                        endpoint: endpoint.clone(),
+                    },
                     "Flow-control input received an incompatible upstream stream shape after normalization.",
                 )
             }

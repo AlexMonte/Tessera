@@ -6,27 +6,30 @@
 //! - `domain`: language model and contracts
 //! - `application`: internal use-case machinery
 //! - `infrastructure`: user-facing API facade
+//!
+//! Default public authoring is spatial source mode through
+//! `AuthoredTesseraProgram` and `TesseraCompiler`.
+//! Explicit graph authoring remains available as an optional public surface
+//! under the `graph` feature.
 
 mod application;
 pub mod domain;
 pub mod infrastructure;
 
 pub mod prelude {
+    pub use crate::domain::*;
+    pub use crate::infrastructure::*;
+}
+
+#[cfg(feature = "graph")]
+pub mod graph_prelude {
     pub use crate::domain::{
-        AtomExpr, AtomExprKind, AtomModifier, AtomOperatorToken, AtomTile, Container,
-        ContainerId, ContainerKind, ContainerSurfaceTile, CycleDuration, CycleSpan, CycleTime,
-        ConnectionRule, DefaultStreamBehavior, Diagnostic, DiagnosticCategory, DiagnosticKind,
-        DiagnosticLocation, EventField, EventValue, FieldValue, FlowControlKind, FlowControlNode,
-        FlowControlPolicy, GroupMembers, InputEndpoint, InputGroupSpec, InputPort,
-        InputSocketSpec, MusicalValue, NodeId, NodeInputRole, NodeSignature, NormalizedContainer,
-        NormalizedProgram, NoteAtom, OutputEndpoint, OutputGroupSpec, OutputNode, OutputPort,
-        OutputSocketSpec, PatternEvent, PatternIr, PatternOutput, PatternStream, PortCountRule,
-        PortGroupId, PortMemberId, Rational, RootRelation, RootSurfaceNodeKind, ScalarAtom, Side,
-        StreamShape, StreamSource, StreamTarget, TesseraProgram, TransformKind, TransformNode,
+        InputEndpoint, InputPort, OutputEndpoint, OutputPort, RootRelation, StreamSource,
+        StreamTarget, TesseraProgram,
     };
-    pub use crate::infrastructure::{
-        CompileOptions, CompileReport, PreviewReport, TesseraCompiler, ValidationReport,
-    };
+    #[cfg(feature = "builders")]
+    pub use crate::infrastructure::TesseraProgramBuilder;
+    pub use crate::infrastructure::TesseraProgramExt;
 }
 
 pub use infrastructure::{
@@ -37,9 +40,9 @@ pub use infrastructure::{
 mod tests {
     use crate::prelude::{
         AtomOperatorToken, AtomTile, Container, ContainerId, ContainerKind, ContainerSurfaceTile,
-        EventValue, InputEndpoint, InputPort, NodeId, NoteAtom, OutputNode, PortGroupId, PortMemberId,
-        Rational, RootRelation, RootSurfaceNodeKind, ScalarAtom, TesseraCompiler, TesseraProgram,
-        TransformKind, TransformNode, StreamSource, StreamTarget,
+        EventValue, InputEndpoint, InputPort, NodeId, NoteAtom, OutputNode, PortGroupId,
+        PortMemberId, Rational, RootRelation, RootSurfaceNodeKind, ScalarAtom, StreamSource,
+        StreamTarget, TesseraCompiler, TesseraProgram, TransformKind, TransformNode,
     };
     use std::collections::BTreeMap;
 
@@ -62,7 +65,9 @@ mod tests {
             ContainerId::new("rate"),
             Container {
                 kind: ContainerKind::Sequence,
-                stack: vec![ContainerSurfaceTile::Atom(AtomTile::Scalar(ScalarAtom::integer(2)))],
+                stack: vec![ContainerSurfaceTile::Atom(AtomTile::Scalar(
+                    ScalarAtom::integer(2),
+                ))],
             },
         );
         root_nodes.insert(
@@ -130,6 +135,9 @@ mod tests {
             }
             value => panic!("unexpected event value: {value:?}"),
         }
-        assert_eq!(report.ir.outputs[0].events[0].span.duration.0, Rational::from_integer(2));
+        assert_eq!(
+            report.ir.outputs[0].events[0].span.duration.0,
+            Rational::from_integer(2)
+        );
     }
 }

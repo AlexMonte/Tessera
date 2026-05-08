@@ -75,7 +75,9 @@ pub(crate) fn apply_transform(
         TransformKind::Rev => main_stream.reverse(),
         TransformKind::Gain => annotate_with_aux(main_stream, aux_streams, EventField::Gain),
         TransformKind::Attack => annotate_with_aux(main_stream, aux_streams, EventField::Attack),
-        TransformKind::Transpose => annotate_with_aux(main_stream, aux_streams, EventField::Transpose),
+        TransformKind::Transpose => {
+            annotate_with_aux(main_stream, aux_streams, EventField::Transpose)
+        }
         TransformKind::Degrade => annotate_with_aux(main_stream, aux_streams, EventField::Degrade),
     };
     Ok(stream)
