@@ -23,8 +23,12 @@ pub use flow::{
     PortMemberId, RootSurfaceNodeKind, Side, StreamShape, TransformKind, TransformNode,
 };
 pub use pattern_ir::{
-    CycleDuration, CycleSpan, CycleTime, EventField, EventValue, FieldValue, PatternEvent,
-    PatternIr, PatternOutput, PatternStream, Rational,
+    ControlEvent, ControlKeyIr, ControlStream, ControlStreamNodeIr, ControlValueIr, CycleDuration,
+    CycleSpan, CycleTime, DeduplicateKeyIr, DeduplicatePolicyIr, DeduplicateWinnerIr, EventField,
+    EventStreamNodeIr, EventValue, FieldValue, FlatPatternOutput, PatternEvent, PatternIr,
+    PatternNodeIr, PatternOutput, PatternStream, PatternStreamShape, PriorityConflictIr,
+    PriorityMergePolicyIr, Rational, ScalarEvent, ScalarStream, ScalarStreamNodeIr,
+    WeightedPatternIr,
 };
 pub use program::{NodeId, NormalizedProgram, TesseraProgram};
 pub use relations::{InputEndpoint, OutputEndpoint, RootRelation, StreamSource, StreamTarget};

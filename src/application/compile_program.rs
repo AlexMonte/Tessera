@@ -6,8 +6,8 @@ use crate::application::{
 };
 use crate::domain::{
     CycleDuration, CycleSpan, CycleTime, Diagnostic, InputEndpoint, NodeId, NormalizedProgram,
-    OutputEndpoint, OutputPort, PatternIr, PatternOutput, PatternStream, PortGroupId, RootRelation,
-    RootSurfaceNodeKind, StreamSource, StreamTarget, TesseraProgram,
+    OutputEndpoint, OutputPort, PatternIr, PatternNodeIr, PatternOutput, PatternStream,
+    PortGroupId, RootRelation, RootSurfaceNodeKind, StreamSource, StreamTarget, TesseraProgram,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -17,6 +17,7 @@ struct NodeOutputKey {
 }
 
 type NodeOutputs = BTreeMap<OutputEndpoint, PatternStream>;
+type NodeOutputNodes = BTreeMap<OutputEndpoint, PatternNodeIr>;
 
 #[allow(dead_code)]
 pub fn compile_program(program: &TesseraProgram) -> Result<PatternIr, Vec<Diagnostic>> {
@@ -40,15 +41,18 @@ pub fn compile_normalized_program(
                 .first()
                 .map(|group| group.group.clone())
                 .unwrap_or_else(|| PortGroupId::new("inputs"));
-            let streams = incoming_output_group_sources(program, node_id, &endpoint);
-            let mut layered = Vec::new();
-            for source in streams {
-                layered.push(compile_source(program, &source, &mut cache, &mut visiting)?);
+            let sources = incoming_output_group_sources(program, node_id, &endpoint);
+            let mut children = Vec::new();
+            for source in sources {
+                let stream = compile_source(program, &source, &mut cache, &mut visiting)?;
+                children.push(PatternNodeIr::event_stream(stream));
             }
-            outputs.push(PatternOutput {
-                id: node_id.clone(),
-                events: PatternStream::layer(layered).events,
-            });
+            let root = match children.len() {
+                0 => PatternNodeIr::event_stream(PatternStream::default()),
+                1 => children.remove(0),
+                _ => PatternNodeIr::merge(children),
+            };
+            outputs.push(PatternOutput::new(node_id.clone(), root));
         }
     }
 
@@ -170,6 +174,20 @@ fn compile_node_all_outputs(
             Some(crate::domain::DiagnosticLocation::RootNode(node_id.clone())),
         )]),
     }
+}
+
+#[allow(dead_code)]
+fn compile_node_all_output_nodes(
+    program: &NormalizedProgram,
+    node_id: &NodeId,
+    cache: &mut BTreeMap<NodeOutputKey, PatternStream>,
+    visiting: &mut BTreeSet<NodeOutputKey>,
+) -> Result<NodeOutputNodes, Vec<Diagnostic>> {
+    let streams = compile_node_all_outputs(program, node_id, cache, visiting)?;
+    Ok(streams
+        .into_iter()
+        .map(|(endpoint, stream)| (endpoint, PatternNodeIr::event_stream(stream)))
+        .collect())
 }
 
 fn compile_container_outputs(
