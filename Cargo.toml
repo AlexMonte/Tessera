@@ -6,6 +6,12 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = false
 
+[features]
+default = ["spatial", "builders"]
+spatial = []
+builders = []
+graph = []
+serde = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

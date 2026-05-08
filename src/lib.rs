@@ -1,163 +1,141 @@
-//! Tessera: a host-agnostic graph analysis kernel for visual editors.
+//! Tessera: a spatial music-pattern language.
 //!
-//! Tessera owns editable graph structure, mutation ops, validation, and
-//! deterministic semantic analysis. Host crates own domain-specific lowering
-//! from analyzed graphs into their own representations.
+//! Public usage should go through `infrastructure`.
+//!
+//! Module boundaries:
+//! - `domain`: language model and contracts
+//! - `application`: internal use-case machinery
+//! - `infrastructure`: user-facing API facade
+//!
+//! Default public authoring is spatial source mode through
+//! `AuthoredTesseraProgram` and `TesseraCompiler`.
+//! Explicit graph authoring remains available as an optional public surface
+//! under the `graph` feature.
 
-pub mod analysis;
-pub mod diagnostics;
-pub mod graph;
-mod internal;
-pub mod ops;
-pub mod piece;
-pub mod piece_registry;
-pub mod semantic;
-pub mod subgraph;
-pub mod types;
+mod application;
+pub mod domain;
+pub mod infrastructure;
 
 pub mod prelude {
-    pub use crate::{
-        AnalysisCache, AnalyzedGraph, AnalyzedNode, Diagnostic, Edge, EdgeId, Graph, GridPos, Node,
-        ParamDef, ParamSchema, Piece, PieceCategory, PieceDef, PieceExecutionKind, PieceRegistry,
-        PieceSemanticKind, PortRole, PortType, Rational, TileSide,
-    };
+    pub use crate::domain::*;
+    pub use crate::infrastructure::*;
 }
 
-pub use analysis::{
-    AnalysisCache, AnalyzedGraph, AnalyzedNode, ResolvedInput, ResolvedInputSource,
-};
-pub use diagnostics::{Diagnostic, DiagnosticKind, DiagnosticSeverity};
-pub use graph::{BatchPlaceEdge, BatchPlaceEntry, Edge, Graph, GraphOp, GraphOpRecord, Node};
-pub use ops::{
-    ApplyOpsOutcome, EdgeConnectProbeReason, EdgeTargetParamProbe, RepairSuggestion,
-    apply_ops_to_graph, apply_ops_to_graph_cached, pick_target_param_for_edge, probe_edge_connect,
-    validate_edge_connect,
-};
-pub use piece::{
-    ParamDef, ParamInlineMode, ParamSchema, ParamTextSemantics, ParamValueKind, Piece, PieceDef,
-    PieceExecutionKind, is_valid_ident_path, is_valid_ident_segment,
-};
-pub use piece_registry::PieceRegistry;
-pub use semantic::{analyze_cached, semantic_pass};
-pub use subgraph::{
-    GeneratedSubgraphPiece, SUBGRAPH_INPUT_1_ID, SUBGRAPH_INPUT_2_ID, SUBGRAPH_INPUT_3_ID,
-    SUBGRAPH_OUTPUT_ID, SubgraphDef, SubgraphInput, SubgraphInputPiece, SubgraphOutputPiece,
-    SubgraphSignature, analyze_subgraph, subgraph_editor_pieces, subgraph_pieces,
-};
-pub use types::{
-    DELAY_PIECE_ID, DomainBridge, DomainBridgeKind, EdgeId, ExecutionDomain, GridPos,
-    PieceCategory, PieceSemanticKind, PortRole, PortType, Rational, TileSide,
-    adjacent_in_direction,
+#[cfg(feature = "graph")]
+pub mod graph_prelude {
+    pub use crate::domain::{
+        InputEndpoint, InputPort, OutputEndpoint, OutputPort, RootRelation, StreamSource,
+        StreamTarget, TesseraProgram,
+    };
+    #[cfg(feature = "builders")]
+    pub use crate::infrastructure::TesseraProgramBuilder;
+    pub use crate::infrastructure::TesseraProgramExt;
+}
+
+pub use infrastructure::{
+    CompileOptions, CompileReport, PreviewReport, TesseraCompiler, ValidationReport,
 };
 
 #[cfg(test)]
 mod tests {
+    use crate::prelude::{
+        AtomOperatorToken, AtomTile, Container, ContainerId, ContainerKind, ContainerSurfaceTile,
+        EventValue, InputEndpoint, InputPort, NodeId, NoteAtom, OutputNode, PortGroupId,
+        PortMemberId, Rational, RootRelation, RootSurfaceNodeKind, ScalarAtom, StreamSource,
+        StreamTarget, TesseraCompiler, TesseraProgram, TransformKind, TransformNode,
+    };
     use std::collections::BTreeMap;
 
-    use super::{AnalysisCache, Graph};
-
     #[test]
-    fn crate_reexports_analysis_cache() {
-        let cache = AnalysisCache::new();
-        assert!(cache.is_empty());
-    }
+    fn crate_compiles_simple_program() {
+        let mut root_nodes = BTreeMap::new();
+        let mut containers = BTreeMap::new();
+        containers.insert(
+            ContainerId::new("phrase"),
+            Container {
+                kind: ContainerKind::Sequence,
+                stack: vec![
+                    ContainerSurfaceTile::Atom(AtomTile::Note(NoteAtom::new("a"))),
+                    ContainerSurfaceTile::Atom(AtomTile::Operator(AtomOperatorToken::Elongate)),
+                    ContainerSurfaceTile::Atom(AtomTile::Scalar(ScalarAtom::integer(3))),
+                ],
+            },
+        );
+        containers.insert(
+            ContainerId::new("rate"),
+            Container {
+                kind: ContainerKind::Sequence,
+                stack: vec![ContainerSurfaceTile::Atom(AtomTile::Scalar(
+                    ScalarAtom::integer(2),
+                ))],
+            },
+        );
+        root_nodes.insert(
+            NodeId::new("slow"),
+            RootSurfaceNodeKind::Transform(TransformNode::new(TransformKind::Slow)),
+        );
+        root_nodes.insert(
+            NodeId::new("out"),
+            RootSurfaceNodeKind::Output(OutputNode::default()),
+        );
+        root_nodes.insert(
+            NodeId::new("a"),
+            RootSurfaceNodeKind::Container {
+                container: ContainerId::new("phrase"),
+            },
+        );
+        root_nodes.insert(
+            NodeId::new("rate"),
+            RootSurfaceNodeKind::Container {
+                container: ContainerId::new("rate"),
+            },
+        );
 
-    #[test]
-    fn crate_reexports_graph_as_live_document_shape() {
-        let graph = Graph {
-            nodes: BTreeMap::new(),
-            edges: BTreeMap::new(),
-            name: "live".into(),
-            cols: 4,
-            rows: 2,
+        let program = TesseraProgram {
+            root_nodes,
+            containers,
+            relations: vec![
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("a")),
+                    to: StreamTarget::TransformInput {
+                        node: NodeId::new("slow"),
+                        endpoint: InputEndpoint::Socket(InputPort::new("main")),
+                    },
+                },
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("rate")),
+                    to: StreamTarget::TransformInput {
+                        node: NodeId::new("slow"),
+                        endpoint: InputEndpoint::Socket(InputPort::new("factor")),
+                    },
+                },
+                RootRelation::FlowsTo {
+                    from: StreamSource::node(NodeId::new("slow")),
+                    to: StreamTarget::OutputInput {
+                        node: NodeId::new("out"),
+                        endpoint: InputEndpoint::GroupMember {
+                            group: PortGroupId::new("inputs"),
+                            member: PortMemberId::new("main"),
+                        },
+                    },
+                },
+            ],
         };
 
-        assert_eq!(graph.name, "live");
-        assert_eq!(graph.cols, 4);
-        assert_eq!(graph.rows, 2);
-    }
-
-    #[test]
-    fn readme_avoids_removed_lowering_api_names() {
-        let readme = include_str!("../README.md");
-        for needle in [
-            "compile",
-            "render_terminals",
-            "Backend",
-            "Expr",
-            "JsBackend",
-            "LuaBackend",
-            "GraphEngine",
-            "HostAdapter",
-        ] {
-            assert!(
-                !readme.contains(needle),
-                "README.md still contains stale lowering reference: {needle}"
-            );
+        let report = TesseraCompiler::new()
+            .compile(&program)
+            .expect("program should compile");
+        assert_eq!(report.ir.outputs.len(), 1);
+        assert_eq!(report.ir.outputs[0].id, NodeId::new("out"));
+        let events = report.ir.outputs[0].events();
+        assert_eq!(events.len(), 1);
+        match &events[0].value {
+            EventValue::Note { value, octave } => {
+                assert_eq!(value, "a");
+                assert_eq!(*octave, None);
+            }
+            value => panic!("unexpected event value: {value:?}"),
         }
-    }
-
-    #[test]
-    fn agents_reference_avoids_removed_lowering_api_names() {
-        let agents = include_str!("../AGENTS.md");
-        for needle in [
-            "compile",
-            "render_terminals",
-            "Backend",
-            "Expr",
-            "JsBackend",
-            "LuaBackend",
-            "GraphEngine",
-            "HostAdapter",
-        ] {
-            assert!(
-                !agents.contains(needle),
-                "AGENTS.md still contains stale lowering reference: {needle}"
-            );
-        }
-    }
-
-    #[test]
-    fn docs_avoid_removed_activity_api_names() {
-        let readme = include_str!("../README.md");
-        let agents = include_str!("../AGENTS.md");
-
-        for needle in [
-            "preview_timeline",
-            "preview_timelines",
-            "build_activity_snapshot",
-            "build_probe_snapshot",
-            "PreviewTimeline",
-            "ActivitySnapshot",
-            "ProbeSnapshot",
-            "HostTime",
-        ] {
-            assert!(
-                !readme.contains(needle),
-                "README.md still contains removed activity API reference: {needle}"
-            );
-            assert!(
-                !agents.contains(needle),
-                "AGENTS.md still contains removed activity API reference: {needle}"
-            );
-        }
-    }
-
-    #[test]
-    fn production_ops_and_subgraph_modules_do_not_call_public_semantic_pass() {
-        for (path, source) in [
-            ("ops/validation.rs", include_str!("ops/validation.rs")),
-            ("ops/pruning.rs", include_str!("ops/pruning.rs")),
-            ("subgraph/analysis.rs", include_str!("subgraph/analysis.rs")),
-        ] {
-            assert!(
-                !source.contains("use crate::semantic::semantic_pass"),
-                "{path} still imports the public semantic_pass wrapper",
-            );
-            assert!(
-                !source.contains("semantic_pass("),
-                "{path} still calls the public semantic_pass wrapper",
-            );
-        }
+        assert_eq!(events[0].span.duration.0, Rational::from_integer(2));
     }
 }
