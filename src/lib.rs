@@ -127,17 +127,15 @@ mod tests {
             .expect("program should compile");
         assert_eq!(report.ir.outputs.len(), 1);
         assert_eq!(report.ir.outputs[0].id, NodeId::new("out"));
-        assert_eq!(report.ir.outputs[0].events.len(), 1);
-        match &report.ir.outputs[0].events[0].value {
+        let events = report.ir.outputs[0].events();
+        assert_eq!(events.len(), 1);
+        match &events[0].value {
             EventValue::Note { value, octave } => {
                 assert_eq!(value, "a");
                 assert_eq!(*octave, None);
             }
             value => panic!("unexpected event value: {value:?}"),
         }
-        assert_eq!(
-            report.ir.outputs[0].events[0].span.duration.0,
-            Rational::from_integer(2)
-        );
+        assert_eq!(events[0].span.duration.0, Rational::from_integer(2));
     }
 }

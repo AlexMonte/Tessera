@@ -594,6 +594,7 @@ fn event_fingerprint(event: &PatternEvent) -> String {
                 format!("degrade:{}/{}", value.numerator, value.denominator)
             }
             EventField::RandomChoice => "random_choice".to_string(),
+            other => format!("{other:?}"),
         })
         .collect::<Vec<_>>()
         .join("|");

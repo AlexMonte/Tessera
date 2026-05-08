@@ -482,22 +482,19 @@ fn compile_program_supports_aux_stream_modulation_and_output_collection() {
     let ir = TesseraCompiler::new()
         .compile_ir(&program)
         .expect("program should compile");
-    assert_eq!(ir.outputs[0].events.len(), 3);
+    let events = ir.outputs[0].events();
+    assert_eq!(events.len(), 3);
     assert!(
-        ir.outputs[0]
-            .events
+        events
             .iter()
             .any(|event| event.span.duration.0 == Rational::from_integer(4))
     );
     assert!(
-        ir.outputs[0]
-            .events
-            .iter()
-            .any(|event| event
-                .fields
-                .contains(&EventField::Gain(FieldValue::Rational {
-                    value: Rational::from_integer(4)
-                })))
+        events.iter().any(|event| event
+            .fields
+            .contains(&EventField::Gain(FieldValue::Rational {
+                value: Rational::from_integer(4)
+            })))
     );
 }
 
@@ -787,8 +784,8 @@ fn flow_control_group_bindings_preserve_target_members() {
         .expect("layer graph should compile");
 
     let values = ir.outputs[0]
-        .events
-        .iter()
+        .events()
+        .into_iter()
         .filter_map(|event| match &event.value {
             EventValue::Note { value, .. } => Some(value.clone()),
             _ => None,
@@ -1011,14 +1008,9 @@ fn chained_to_after_transform_uses_transformed_duration() {
         })
         .expect("program should compile");
 
-    assert_eq!(
-        ir.outputs[0].events[0].span.duration.0,
-        Rational::from_integer(3)
-    );
-    assert_eq!(
-        ir.outputs[0].events[1].span.start.0,
-        Rational::from_integer(3)
-    );
+    let events = ir.outputs[0].events();
+    assert_eq!(events[0].span.duration.0, Rational::from_integer(3));
+    assert_eq!(events[1].span.start.0, Rational::from_integer(3));
 }
 
 #[test]
@@ -1093,7 +1085,7 @@ fn split_outputs_are_endpoint_addressed() {
     let ir = TesseraCompiler::new()
         .compile_ir(&program)
         .expect("split program should compile");
-    assert_eq!(ir.outputs[0].events.len(), 2);
+    assert_eq!(ir.outputs[0].events().len(), 2);
 }
 
 #[test]
@@ -1164,7 +1156,7 @@ fn flow_control_layer_compiles_and_normalized_entrypoint_matches() {
         .compile(&program)
         .expect("program should compile");
     assert_eq!(report.normalized.containers.len(), 2);
-    assert_eq!(report.ir.outputs[0].events.len(), 2);
+    assert_eq!(report.ir.outputs[0].events().len(), 2);
 }
 
 #[test]
@@ -1236,11 +1228,9 @@ fn merge_append_chains_streams_sequentially() {
         })
         .expect("merge append should compile");
 
-    assert_eq!(ir.outputs[0].events.len(), 2);
-    assert_eq!(
-        ir.outputs[0].events[1].span.start.0,
-        Rational::from_integer(1)
-    );
+    let events = ir.outputs[0].events();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1].span.start.0, Rational::from_integer(1));
 }
 
 #[test]
@@ -1318,8 +1308,9 @@ fn mask_scale_adds_gain_from_mask_stream() {
         })
         .expect("mask scale should compile");
 
+    let events = ir.outputs[0].events();
     assert!(
-        ir.outputs[0].events[0]
+        events[0]
             .fields
             .contains(&EventField::Gain(FieldValue::Rational {
                 value: Rational::from_integer(3)
@@ -1404,7 +1395,7 @@ fn route_by_label_partitions_named_note_streams() {
         })
         .expect("route by label should compile");
 
-    assert_eq!(ir.outputs[0].events.len(), 2);
+    assert_eq!(ir.outputs[0].events().len(), 2);
 }
 
 #[test]
@@ -1498,7 +1489,8 @@ fn switch_control_value_selects_candidate_index() {
         })
         .expect("switch control value should compile");
 
-    match &ir.outputs[0].events[0].value {
+    let events = ir.outputs[0].events();
+    match &events[0].value {
         EventValue::Note { value, .. } => assert_eq!(value, "b"),
         other => panic!("expected note event, got {other:?}"),
     }
